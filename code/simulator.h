@@ -39,7 +39,7 @@ typedef uint64_t u64;
 #define IsDigit(c) (c >= '0' && c <= '9')
 #define IsWhitespace(c) (c == ' ' || c == '\n' || c == '\r')
 
-#define FloatEq(f1, f2) f1 - 0.0001f <= f2 && f1 + 0.0001f >= f2
+#define FloatEq(f1, f2) (fabs(f1 - f2) <= 0.001f)
 
 static void
 skip_whitespace(u32* i, char* str){  while(IsWhitespace(str[*i])) *i = *i + 1; if (IsWhitespace(str[*i])) *i = *i + 1; }
@@ -319,7 +319,7 @@ interval_exists(Interval i, b32 inclusive = true)
     }
     else if (inclusive)
     {
-        return i.start <= i.end;
+        return FloatEq(i.start, i.end) || i.start < i.end;
     }
     else
     {
@@ -369,12 +369,6 @@ struct Constraint
     u32 from;
     u32 to;
 };
-
-#if SIMULATOR_DEBUG
-global_variable u32 g_constraint_count = 0;
-global_variable u32 g_max_constraints = 1000000;
-global_variable Constraint* g_constraints;
-#endif
 
 static b32
 constraints_equal(Constraint c1, Constraint c2)
@@ -736,7 +730,7 @@ remove_interval(MemoryArena* memory_arena, SafeIntervalCold* intervals,
             SafeInterval lower_interval = {safe_interval.start, split_interval.start - DELTA};
             SafeInterval upper_interval = {split_interval.end + DELTA, safe_interval.end};
 
-            if (FloatEq(conflict_interval.start, lower_interval.start) || !interval_exists(lower_interval, false))
+            if (!interval_exists(lower_interval, false))
             {
                 if (!interval_exists(upper_interval, false))
                 {
@@ -1398,7 +1392,7 @@ make_constraints(MemoryArena* memory_arena, CBSNode* node, u32 agent_id)
 
     u32 constraint_count = 0;
     CBSNode* p = node;
-    while (p)
+    while (p->parent)
     {
         if (p->constraint.agent_id == agent_id)
         {
@@ -1410,7 +1404,7 @@ make_constraints(MemoryArena* memory_arena, CBSNode* node, u32 agent_id)
 
     p = node;
     u32 constraint_index = 0;
-    while (p)
+    while (p->parent)
     {
         if (p->constraint.agent_id == agent_id)
         {
@@ -1425,82 +1419,127 @@ make_constraints(MemoryArena* memory_arena, CBSNode* node, u32 agent_id)
     return result;
 }
 
-#if 0
-static CBSNode*
-create_cbs_node_from_conflict(MemoryArena* memory_arena,
-                              CBSNode* parent,
-                              u32 agent_count, Graph* graph,
-                              AgentInfo* agents, u32 agent_id)
-{     
-    CBSNode* result = 0;
-    
-    f32 cost_value;
-
-    size_t tmp_used = memory_arena->used;
-    Path* path_buffer = push_array(memory_arena, Path, agent_count);
-
-#if 0
-    u32 constraint_count = 0;
-    Conflicts* _p = conflicts;
-    while (_p) { constraint_count++; _p = _p->next; }
-    Constraint* constraints = push_array(memory_arena, Constraint, constraint_count);
-    _p = conflicts;
-    u32 i = 0;
-    /* constraints[0] = {new_conflict.interval, new_conflict.agent_1_id, new_conflict.action_1}; */
-    while (_p) { constraints[i++] = { _p->interval, _p->agent_1_id, _p->action_1.type, _p->action_1.move.from, _p->action_1.move.to }; _p = _p->next; }
-
-    for (i = 0; i < constraint_count; i++)
-    {
-        for (u32 j = i + 1; j < constraint_count; j++)
-        {
-            Assert(!constraints_equal(constraints[i], constraints[j]));
-        }
-    }
+#if SIMULATOR_DEBUG
+global_variable u32 max_visited = 100000;
+global_variable u32 visited_count_1 = 0;
+global_variable ComputeSafeIntervalsResult* visited_1;
+global_variable u32 visited_count_2 = 0;
+global_variable ComputeSafeIntervalsResult* visited_2;
 #endif
 
-    for (u32 agent_index = 0;
-         agent_index < agent_count;
-         agent_index++)
+static CBSNode*
+create_cbs_node(MemoryArena* memory_arena, CBSNode* node,
+                Constraint constraint, Graph* graph, AgentInfo* agents,
+                Path* path_buffer, u32 agent_count, u32 agent_id)
+{
+    CBSNode* result = 0;
+    
+    b32 node_1_ok = true;
+    f32 cost_1 = 0;
+    CBSNode* node_1_tmp = push_struct(memory_arena, CBSNode);
+    node_1_tmp->parent = node;
+    node_1_tmp->constraint = constraint;
+    MakeConstraintResult constraints = make_constraints(memory_arena, node_1_tmp, agent_id);
+    ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, constraints.data, constraints.count);
+#if SIMULATOR_DEBUG
+    u32 count = agent_id == 0 ? visited_count_1 : visited_count_2;
+    for (u32 i = 0; i < count && constraints.count > 0; i++)
     {
-        MakeConstraintResult constraints = make_constraints(memory_arena, parent);
-        ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, constraints.data, constraints.count);
-        path_buffer[agent_index] = sipp(memory_arena, graph,
-                                        agents[agent_index].start,
-                                        agents[agent_index].goal,
-                                        h, safe_intervals);
-        if (path_buffer[agent_index].vertex_count == 0)
+        b32 eq = true;
+        ComputeSafeIntervalsResult x;
+        if (agent_id == 0) x = visited_1[i];
+        else x = visited_2[i];
+        
+        for (u32 j = 0; j < graph->vertex_count; j++)
         {
-            return result;
+            for (u32 k = 0; k < x.safe_intervals_vertex_count[j]; k++)
+            {
+                if (x.safe_intervals_vertex_count[j] !=
+                    safe_intervals.safe_intervals_vertex_count[j])
+                {
+                    eq = false;
+                    break;
+                }
+                        
+                if (!FloatEq(x.safe_intervals_vertex[j][k].start,
+                             safe_intervals.safe_intervals_vertex[j][k].start) ||
+                    !FloatEq(x.safe_intervals_vertex[j][k].end,
+                             safe_intervals.safe_intervals_vertex[j][k].end))
+                {
+                    eq = false;
+                    break;
+                }
+            }
+
+            for (u32 jj = 0; jj < graph->vertex_count; jj++)
+            {
+                u32 edge_index = j * graph->vertex_count + jj;
+                for (u32 k = 0; k < x.safe_intervals_edge_count[edge_index]; k++)
+                {
+                    if (x.safe_intervals_edge_count[edge_index] !=
+                        safe_intervals.safe_intervals_edge_count[edge_index])
+                    {
+                        eq = false;
+                        break;
+                    }
+                        
+                    if (!FloatEq(x.safe_intervals_edge[edge_index][k].start,
+                                 safe_intervals.safe_intervals_edge[edge_index][k].start) ||
+                        !FloatEq(x.safe_intervals_edge[edge_index][k].end,
+                                 safe_intervals.safe_intervals_edge[edge_index][k].end))
+                    {
+                        eq = false;
+                        break;
+                    }
+                }
+
+                if (!eq) break;
+            }
+
+            if (!eq) break;
+        }
+        if (eq)
+        {
+            node_1_ok = false;
+            break;
         }
     }
-    cost_value = cost(path_buffer, agent_count);
 
-    FindConflictResult find_conflict_result = find_conflict(path_buffer, agent_count, graph);
-    if (find_conflict_result.no_conflict_found)
+    if (agent_id == 0) visited_1[visited_count_1++] = safe_intervals;
+    else visited_2[visited_count_2++] = safe_intervals;
+    
+#endif
+    size_t tmp_used = memory_arena->used;
+    
+    Path path_1 = sipp(memory_arena, graph,
+                       agents[agent_id].start,
+                       agents[agent_id].goal,
+                       h, safe_intervals);
+    if (path_1.vertex_count == 0)
     {
-        Assert(!"done");
+        node_1_ok = false;
     }
-    Conflict new_conflict = find_conflict_result.conflict;
+    else
+    {
+        Path tmp = path_buffer[agent_id];
+        path_buffer[agent_id] = path_1;
+        cost_1 = cost(path_buffer, agent_count);
+        path_buffer[agent_id] = tmp;
+    }
 
     memory_arena->used = tmp_used;
 
-    result = push_struct(memory_arena, CBSNode);
-
-    result->constraint = new_conflict;
-    
-    Assert(g_constraint_count < g_max_constraints);
-    g_constraints[g_constraint_count++] = {conflict.interval, conflict.agent_1_id,
-                                           conflict.action_1.type,
-                                           conflict.action_1.move.from, conflict.action_1.move.to};
-
-    result.conflicts = push_struct(memory_arena, Conflicts);
-    *result.conflicts = conflict;
-    result.cost = cost_value;
+    if (node_1_ok)
+    {
+        result = push_struct(memory_arena, CBSNode);
+        result->parent = node;
+        result->constraint = constraint;
+        result->cost = cost_1;
+    }
 
     return result;
 }
-#endif
-    
+
 static Solution
 cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
 {
@@ -1509,52 +1548,23 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
     result.path_count = agent_count;
 
     CBSNode* root = push_struct(memory_arena, CBSNode);
-    /* root.conflicts = push_struct(memory_arena, Conflicts); */
-#if 0
-    size_t tmp_used = memory_arena->used;
-    Path* path_buffer = push_array(memory_arena, Path, agent_count);
-    for (u32 agent_index = 0;
-         agent_index < agent_count;
-         agent_index++)
-    {
-        ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, 0, agent_index);
-        path_buffer[agent_index] = sipp(memory_arena, graph,
-                                        agents[agent_index].start,
-                                        agents[agent_index].goal,
-                                        h, safe_intervals);
-    }
-
-    FindConflictResult find_conflict_result = find_conflict(path_buffer, agent_count, graph);
-    if (find_conflict_result.no_conflict_found)
-    {
-        Assert(!"done");
-    }
-    root.constraint = find_conflict_result.conflict;
-    
-    root.cost = cost(path_buffer, agent_count);
-    memory_arena->used = tmp_used;
-#endif
     
     CBSQueue* queue = 0;
     queue = add_cbs_node(memory_arena, queue, root);
     u32 queue_count = 1;
 
-#if SIMULATOR_DEBUG
-    u32 max_visited = 100000;
-    u32 visited_count = 0;
-    CBSNode* visited = push_array(memory_arena, CBSNode, max_visited);
-    g_constraints = push_array(memory_arena, Constraint, g_max_constraints);
-#endif
+    visited_1 = push_array(memory_arena, ComputeSafeIntervalsResult, max_visited);
+    visited_2 = push_array(memory_arena, ComputeSafeIntervalsResult, max_visited);
     
     while (queue_count > 0)
     {
-#if 0
+#if 1
         {
-            tmp_used = memory_arena->used;
+            size_t tmp_used = memory_arena->used;
             CBSQueue* p = queue;
             CBSNode* _queue = push_array(memory_arena, CBSNode, queue_count);
             u32 i = 0;
-            while (p) { _queue[i++] = p->node; p = p->next; }
+            while (p) { _queue[i++] = *p->node; p = p->next; }
             memory_arena->used = tmp_used;
         }
 #endif
@@ -1574,6 +1584,7 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
         {
             MakeConstraintResult constraints = make_constraints(memory_arena, current_node, agent_index);
             ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, constraints.data, constraints.count);
+
             path_buffer[agent_index] = sipp(memory_arena, graph,
                                             agents[agent_index].start,
                                             agents[agent_index].goal,
@@ -1595,78 +1606,26 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
             }
             Conflict new_conflict = find_conflict_result.conflict;
 
-            b32 node_1_ok = true;
-            f32 cost_1 = 0;
-            CBSNode* node_1_tmp = push_struct(memory_arena, CBSNode);
-            node_1_tmp->parent = current_node;
-            node_1_tmp->constraint = {new_conflict.interval,
-                                      new_conflict.agent_1_id, new_conflict.action_1.type,
-                                      new_conflict.action_1.move.from, new_conflict.action_1.move.to};
-            MakeConstraintResult constraints_1 = make_constraints(memory_arena, node_1_tmp, new_conflict.agent_1_id);
-            ComputeSafeIntervalsResult safe_intervals_1 = compute_safe_intervals(memory_arena, graph, constraints_1.data, constraints_1.count);
-            Path path_1 = sipp(memory_arena, graph,
-                               agents[new_conflict.agent_1_id].start,
-                               agents[new_conflict.agent_1_id].goal,
-                               h, safe_intervals_1);
-            if (path_1.vertex_count == 0)
+            Constraint constraint_1 =  {new_conflict.interval,
+                                        new_conflict.agent_1_id, new_conflict.action_1.type,
+                                        new_conflict.action_1.move.from, new_conflict.action_1.move.to};
+            CBSNode* node_1 = create_cbs_node(memory_arena, current_node,
+                                              constraint_1, graph, agents,
+                                              path_buffer, agent_count, new_conflict.agent_1_id);
+            if (node_1)
             {
-                node_1_ok = false;
-            }
-            else
-            {
-                Path tmp = path_buffer[new_conflict.agent_1_id];
-                path_buffer[new_conflict.agent_1_id] = path_1;
-                cost_1 = cost(path_buffer, agent_count);
-                path_buffer[new_conflict.agent_1_id] = tmp;
-            }
-            
-            b32 node_2_ok = true;
-            f32 cost_2 = 0;
-            CBSNode* node_2_tmp = push_struct(memory_arena, CBSNode);
-            node_2_tmp->parent = current_node;
-            node_2_tmp->constraint = {new_conflict.interval,
-                                      new_conflict.agent_2_id, new_conflict.action_2.type,
-                                      new_conflict.action_2.move.from, new_conflict.action_2.move.to};
-            MakeConstraintResult constraints_2 = make_constraints(memory_arena, node_2_tmp, new_conflict.agent_2_id);
-            ComputeSafeIntervalsResult safe_intervals_2 = compute_safe_intervals(memory_arena, graph, constraints_2.data, constraints_2.count);
-            Path path_2 = sipp(memory_arena, graph,
-                               agents[new_conflict.agent_2_id].start,
-                               agents[new_conflict.agent_2_id].goal,
-                               h, safe_intervals_2);
-            if (path_2.vertex_count == 0)
-            {
-                node_2_ok = false;
-            }
-            else
-            {
-                Path tmp = path_buffer[new_conflict.agent_2_id];
-                path_buffer[new_conflict.agent_2_id] = path_2;
-                cost_2 = cost(path_buffer, agent_count);
-                path_buffer[new_conflict.agent_2_id] = tmp;
-            }
-
-            memory_arena->used = tmp_used;
-
-            if (node_1_ok)
-            {
-                CBSNode* node_1 = push_struct(memory_arena, CBSNode);
-                node_1->parent = current_node;
-                node_1->constraint = {new_conflict.interval,
-                                      new_conflict.agent_1_id, new_conflict.action_1.type,
-                                      new_conflict.action_1.move.from, new_conflict.action_1.move.to};
-                node_1->cost = cost_1;
                 queue = add_cbs_node(memory_arena, queue, node_1);
                 queue_count++;
             }
             
-            if (node_2_ok)
+            Constraint constraint_2 =  {new_conflict.interval,
+                                        new_conflict.agent_2_id, new_conflict.action_2.type,
+                                        new_conflict.action_2.move.from, new_conflict.action_2.move.to};
+            CBSNode* node_2 = create_cbs_node(memory_arena, current_node,
+                                              constraint_2, graph, agents,
+                                              path_buffer, agent_count, new_conflict.agent_2_id);
+            if (node_2)
             {
-                CBSNode* node_2 = push_struct(memory_arena, CBSNode);
-                node_2->parent = current_node;
-                node_2->constraint = {new_conflict.interval,
-                                      new_conflict.agent_2_id, new_conflict.action_2.type,
-                                      new_conflict.action_2.move.from, new_conflict.action_2.move.to};
-                node_2->cost = cost_2;
                 queue = add_cbs_node(memory_arena, queue, node_2);
                 queue_count++;
             }
@@ -1675,29 +1634,6 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
         {
             memory_arena->used = tmp_used;
         }
-
-#if 0
-        CBSNode* node_1 = create_cbs_node_from_conflict(memory_arena, current_node, agent_count, graph, agents, current_node.new_conflict.agent_1_id);
-#if 0 //SIMULATOR_DEBUG
-        if (!node_1.discard && !cbs_node_in_array(memory_arena, node_1, visited, visited_count))
-#else
-        if (node_1)
-#endif
-        {
-            queue = add_cbs_node(memory_arena, queue, node_1);
-            queue_count++;
-        }
-        CBSNode* node_2 = create_cbs_node_from_conflict(memory_arena, current_node, agent_count, graph, agents, current_node.new_conflict.agent_2_id);
-#if 0 //SIMULATOR_DEBUG
-        if (!node_2.discard && !cbs_node_in_array(memory_arena, node_2, visited, visited_count))
-#else
-        if (node_2)
-#endif
-        {
-            queue = add_cbs_node(memory_arena, queue, node_2);
-            queue_count++;
-        }
-#endif
     }
     
     return result;
