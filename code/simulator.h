@@ -5,6 +5,10 @@
 #endif
 
 #include <stdint.h>
+#include <vector>
+#include <queue>
+#include <list>
+#include <functional>
 
 typedef int32_t b32;
 typedef float f32;
@@ -194,50 +198,6 @@ DEBUG_PLATFORM_FREE_FILE_MEMORY(DEBUG_platform_free_file_memory_stub)
 global_variable _debug_platform_free_file_memory* DEBUG_platform_free_file_memory_ = DEBUG_platform_free_file_memory_stub;
 #define DEBUG_platform_free_file_memory DEBUG_platform_free_file_memory_
 
-struct LinkedList
-{
-    u8* data;
-    u32 data_size_bytes;
-    LinkedList* next;
-
-    void add(MemoryArena* memory_arena, u8* new_data, u32 new_data_size_bytes)
-    {
-        if (this->data == 0)
-        {
-            this->data = new_data;
-            this->data_size_bytes = new_data_size_bytes;
-        }
-        else
-        {
-#if 0
-            LinkedList* list = this;
-            while (list->next)
-            {
-                list = list->next;
-            }
-            list->next = push_struct(memory_arena, LinkedList);
-            list = list->next;
-            list->data = new_data;
-            list->data_size_bytes = new_data_size_bytes;
-#else
-            LinkedList* new_entry = push_struct(memory_arena, LinkedList);
-            new_entry->next = this->next;
-            new_entry->data = this->data;
-            new_entry->data_size_bytes = this->data_size_bytes;
-            this->next = new_entry;
-            this->data = new_data;
-            this->data_size_bytes = new_data_size_bytes;
-#endif
-        }
-    }
-
-    b32 empty()
-    {
-        if (this->data == 0) Assert(this->data_size_bytes == 0);
-        return this->data == 0;
-    }
-};
-
 struct Edge
 {
     u32 to;
@@ -248,13 +208,14 @@ struct Vertex
 {
     f32 x;
     f32 y;
-    LinkedList* edges;
+    std::vector<f32> speeds;
+    std::vector<Edge> edges;
 };
 
 struct Graph
 {
     u32 vertex_count;
-    Vertex* vertices;
+    std::vector<Vertex> vertices;
 };
 
 struct SIPPNode
@@ -263,7 +224,14 @@ struct SIPPNode
     f32 arrival_time;
     f32 safe_interval_end;
     f32 fscore;
-    SIPPNode* parent;    
+    SIPPNode* parent;
+
+    constexpr b32
+    operator()(const SIPPNode*& node_1, const SIPPNode*& node_2) const 
+        {
+            return node_1->fscore < node_2->fscore;
+        }
+
 };
 
 struct WaitConflict
@@ -400,95 +368,13 @@ struct CBSNode
     CBSNode* parent;
     Constraint constraint;
     f32 cost;
+
+    b32
+    operator()(const CBSNode*& node_1, const CBSNode*& node_2) const 
+        {
+            return node_1->cost < node_2->cost;
+        }
 };
-
-#if 0
-static b32
-cbs_node_equal(MemoryArena* memory_arena, CBSNode node1, CBSNode node2)
-{
-    size_t tmp = memory_arena->used;
-    
-    b32 result = true;
-
-    u32 constraint_count1 = 0;
-    Conflicts* p = node1.conflicts;
-    while (p) { constraint_count1++; p = p->next; }
-    Constraint* constraints1 = push_array(memory_arena, Constraint, constraint_count1 + 1);
-    p = node1.conflicts;
-    u32 i = 1;
-    constraints1[0] ={ node1.new_conflict.interval,
-                       node1.new_conflict.agent_1_id,
-                       node1.new_conflict.action_1.type,
-                       node1.new_conflict.action_1.move.from,
-                       node1.new_conflict.action_1.move.to };
-    while (p)
-    {
-        constraints1[i++] = { p->interval,
-                              p->agent_1_id,
-                              p->action_1.type,
-                              p->action_1.move.from,
-                              p->action_1.move.to };
-        p = p->next;
-    }
-
-    u32 constraint_count2 = 0;
-    p = node2.conflicts;
-    while (p) { constraint_count2++; p = p->next; }
-    Constraint* constraints2 = push_array(memory_arena, Constraint, constraint_count2 + 1);
-    p = node2.conflicts;
-    i = 1;
-    constraints2[0] ={ node2.new_conflict.interval,
-                       node2.new_conflict.agent_1_id,
-                       node2.new_conflict.action_1.type,
-                       node2.new_conflict.action_1.move.from,
-                       node2.new_conflict.action_1.move.to };
-    while (p)
-    {
-        constraints2[i++] = { p->interval,
-                              p->agent_1_id,
-                              p->action_1.type,
-                              p->action_1.move.from,
-                              p->action_1.move.to };
-        p = p->next;
-    }
-
-    b32* checked = push_array(memory_arena, b32, constraint_count2);
-    
-    if (constraint_count1 == constraint_count2)
-    {
-        for (i = 0; i < constraint_count1; i++)
-        {
-            for (u32 j = 0; j < constraint_count2; j++)
-            {
-                if (!checked[j] &&
-                    constraints_equal(constraints1[i], constraints2[j]))
-                {
-                    checked[j] = true;
-                    break;
-                }
-            }
-            
-        }
-
-        for (i = 0; i < constraint_count1; i++)
-        {
-            if (!checked[i])
-            {
-                result = false;
-                break;
-            }
-        }
-    }
-    else
-    {
-        result = false;
-    }
-
-    memory_arena->used = tmp;
-    
-    return result;
-}
-#endif
 
 struct Path
 {
@@ -510,25 +396,6 @@ struct CBSQueue
     CBSNode* node;
     b32 is_used;
 };
-
-#if 0
-static b32
-cbs_node_in_array(MemoryArena* memory_arena, CBSNode node, CBSNode* array, u32 count)
-{
-    b32 result = false;
-    
-    for (u32 i = 0; i < count; i++)
-    {
-        if (cbs_node_equal(memory_arena, node, array[i]))
-        {
-            result = true;
-            break;
-        }
-    }
-
-    return result;
-}
-#endif
 
 static SIPPQueue*
 add_astar_node(MemoryArena* memory_arena, SIPPQueue* queue, SIPPNode* node)
@@ -576,63 +443,6 @@ add_astar_node(MemoryArena* memory_arena, SIPPQueue* queue, SIPPNode* node)
             iter_prev->next = next;
         }
     }
-
-
-#if 0
-    else if(!queue->next)
-    {
-        SIPPQueue* next = push_struct(memory_arena, SIPPQueue);
-        next->node = node;
-        next->is_used = true;
-
-        if (node->fscore < queue->node->fscore)
-        {
-            next->prev = 0;
-            next->next = queue;
-            queue->prev = next;
-            queue = next;
-        }
-        else
-        {
-            queue->next = next;
-            next->prev = queue;
-        }
-    }
-    else if(node->fscore < queue->node->fscore)
-    {
-        SIPPQueue* next = push_struct(memory_arena, SIPPQueue);
-        next->node = node;
-        next->is_used = true;
-        
-        next->prev = 0;
-        next->next = queue;
-        queue->prev = next;
-        queue = next;
-    }
-    else
-    {
-        SIPPQueue* next = push_struct(memory_arena, SIPPQueue);
-        next->node = node;
-        next->is_used = true;
-
-        SIPPQueue* iter = queue;
-        while (iter->next &&
-               node->fscore >= iter->node->fscore)
-        {
-            iter = iter->next;
-        }
-
-        SIPPQueue* iter_prev = iter->prev;
-        if (iter_prev)
-        {
-            iter_prev->next = next;
-            next->prev = iter_prev;
-        }
-        
-        iter->prev = next;
-        next->next = iter;
-    }
-#endif
     
     return queue;
 }
@@ -676,20 +486,17 @@ has_visited(TimeNode* node, f32 time)
 }
 
 static b32
-can_wait_forever(SafeInterval* safe_intervals, u32 safe_interval_count, f32 from_time)
+can_wait_forever(std::vector<SafeInterval> safe_intervals, f32 from_time)
 {
     b32 result = false;
-    if (safe_interval_count == 0)
+    if (safe_intervals.size() == 0)
     {
         result = true;
     }
     else
     {
-        for (u32 interval_index = 0;
-             interval_index < safe_interval_count;
-             interval_index++)
+        for (SafeInterval interval : safe_intervals)
         {
-            SafeInterval interval = safe_intervals[interval_index];
             if (interval.start <= from_time && FloatEq(interval.end, INF))
             {
                 result = true;
@@ -700,31 +507,23 @@ can_wait_forever(SafeInterval* safe_intervals, u32 safe_interval_count, f32 from
     return result;
 }
 
-struct SafeIntervalCold
-{
-    SafeIntervalCold* prev;
-    SafeIntervalCold* next;
-    SafeInterval interval;
-};
-
 struct ComputeSafeIntervalsResult
 {
-    SafeInterval** safe_intervals_vertex;
-    u32* safe_intervals_vertex_count;
-    SafeInterval** safe_intervals_edge;
-    u32* safe_intervals_edge_count;
+    std::vector<std::vector<SafeInterval>> safe_intervals_vertex;
+    std::vector<std::vector<SafeInterval>> safe_intervals_edge;
 };
 
-static SafeIntervalCold*
-remove_interval(MemoryArena* memory_arena, SafeIntervalCold* intervals,
-                Interval conflict_interval, u32* safe_intervals_count, u32 interval_index)
+static void
+remove_interval(std::vector<SafeInterval>& intervals, Interval conflict_interval)
 {
-    SafeIntervalCold* current = intervals;
-    
-    while (current)
+    std::vector<SafeInterval> intervals_to_add;
+    std::vector<u32> intervals_to_remove;
+    std::vector<SafeInterval>::iterator it = intervals.begin();
+    for (u32 safe_interval_index = 0;
+           safe_interval_index < intervals.size();
+           safe_interval_index++)
     {
-        SafeInterval safe_interval = current->interval;
-
+        SafeInterval safe_interval = intervals[safe_interval_index];
         SafeInterval split_interval = intersection(conflict_interval, safe_interval);
         if (interval_exists(split_interval, false))
         {
@@ -735,56 +534,34 @@ remove_interval(MemoryArena* memory_arena, SafeIntervalCold* intervals,
             {
                 if (!interval_exists(upper_interval, false))
                 {
-                    safe_intervals_count[interval_index]--;
-                    if (current->next)
-                    {
-                        current->next->prev = current->prev;
-                    }
-
-                    if (current->prev)
-                    {
-                        current->prev->next = current->next;
-                    }
-                    else
-                    {
-                        intervals = intervals->next;
-                    }
+                    intervals_to_remove.push_back(safe_interval_index);
                 }
                 else
                 {
-                    current->interval = upper_interval;
+                    intervals_to_remove.push_back(safe_interval_index);
+                    intervals_to_add.push_back(upper_interval);
                 }
             }
             else if (!interval_exists(upper_interval, false))
             {
-                current->interval = lower_interval;
+                intervals_to_remove.push_back(safe_interval_index);
+                intervals_to_add.push_back(lower_interval);
             }
             else
             {
-                safe_intervals_count[interval_index]++;
-
-                current->interval = lower_interval;
-                            
-                SafeIntervalCold* new_interval = push_struct(memory_arena, SafeIntervalCold);
-                new_interval->interval = upper_interval;
-
-                SafeIntervalCold* tmp = current->next;
-                current->next = new_interval;
-                new_interval->next = tmp;
-                new_interval->prev = current;
-                if (tmp)
-                {
-                    tmp->prev = new_interval;
-                }
-                            
-                current = new_interval;
+                intervals_to_remove.push_back(safe_interval_index);
+                intervals_to_add.push_back(lower_interval);
+                intervals_to_add.push_back(upper_interval);
             }
         }
-
-        current = current->next;
     };
+
+    for (u32 remove_index : intervals_to_remove)
+    {
+        intervals.erase(intervals.begin() + remove_index);
+    }
     
-    return intervals;
+    intervals.insert(intervals.begin(), intervals_to_add.begin(), intervals_to_add.end());
 }
 
 static u32
@@ -800,10 +577,8 @@ sipp(MemoryArena* memory_arena,
      f32 (*heuristic)(Graph*, u32, u32),
      ComputeSafeIntervalsResult safe_intervals)
 {
-    SafeInterval** safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
-    u32* safe_intervals_vertex_count = safe_intervals.safe_intervals_vertex_count;
-    SafeInterval** safe_intervals_edge = safe_intervals.safe_intervals_edge;
-    u32* safe_intervals_edge_count = safe_intervals.safe_intervals_edge_count;
+    std::vector<std::vector<SafeInterval>> safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
+    std::vector<std::vector<SafeInterval>> safe_intervals_edge = safe_intervals.safe_intervals_edge;
     
     Path result = {};
 
@@ -829,33 +604,10 @@ sipp(MemoryArena* memory_arena,
 
     u32 expansions = 0;
     while(queue_count > 0)
-    {
-#if 0
-        {
-            size_t tmp_used = memory_arena->used;
-            u32 path_length = 0;
-            SIPPNode* p = queue->node;
-            while (p) { path_length++; p = p->parent; }
-            SIPPNode* path = push_array(memory_arena, SIPPNode, path_length);
-            p = queue->node;
-            u32 i = 0;
-            while (p) { path[i++] = *p; p = p->parent; }
-            memory_arena->used = tmp_used;
-        }
-
-        {
-            size_t tmp_used = memory_arena->used;
-            SIPPQueue* p = queue;
-            SIPPNode* _queue = push_array(memory_arena, SIPPNode, queue_count);
-            u32 i = 0;
-            while (p) { _queue[i++] = *p->node; p = p->next; }
-            memory_arena->used = tmp_used;
-        }
-#endif
-        
+    {        
         expansions++;
         SIPPNode* current_node = queue->node;
-        queue = queue->next;
+        queue = queue->next;;
         queue_count--;
         
         u32 current_vertex = current_node->vertex;
@@ -864,7 +616,7 @@ sipp(MemoryArena* memory_arena,
         
         Assert(current_vertex < graph->vertex_count);
         
-        if (current_vertex == goal && can_wait_forever(safe_intervals_vertex[current_vertex], safe_intervals_vertex_count[current_vertex], arrival_time))
+        if (current_vertex == goal && can_wait_forever(safe_intervals_vertex[current_vertex], arrival_time))
         {
             // NOTE: Reconstruct path from best_path_vertex
             u32 path_length = 0;
@@ -890,39 +642,19 @@ sipp(MemoryArena* memory_arena,
             {
                 result.vertices[vertex_index] = path[result.vertex_count - 1 - vertex_index];
             }
-
-#if 0 
-            // TODO: fix root departure_time
-            u32 neighbour_id = result.vertices[1].vertex;
-            LinkedList* neighbour = graph->vertices[start].edges;
-            b32 found_neighbour = false;
-            f32 neighbour_cost = 0;
-            while (neighbour && !found_neighbour)
-            {
-                Edge* edge = (Edge*)neighbour->data;
-                if (edge->to == neighbour_id)
-                {
-                    neighbour_cost = edge->cost;
-                    found_neighbour = true;
-                    break;
-                }
-                neighbour = neighbour->next;
-            }
-            Assert(found_neighbour);
-            result.vertices[0].departure_time = result.vertices[1].arrival_time - neighbour_cost;
-#endif
             
             break;
         }
 
-        LinkedList* current_neighbour = graph->vertices[current_vertex].edges;
-        while (current_neighbour && !current_neighbour->empty())
+        std::vector<Edge> neighbours = graph->vertices[current_vertex].edges;
+        for (Edge edge : neighbours)
+        /* while (current_neighbour && !current_neighbour->empty()) */
         {
-            Edge* edge = (Edge*)current_neighbour->data;
-            f32 neighbour_cost = edge->cost;
-            u32 neighbour_to = edge->to;
+            /* Edge* edge = (Edge*)current_neighbour->data; */
+            f32 neighbour_cost = edge.cost;
+            u32 neighbour_to = edge.to;
             f32 hvalue = heuristic(graph, neighbour_to, goal);
-            current_neighbour = current_neighbour->next;
+            /* current_neighbour = current_neighbour->next; */
 
             f32 earliest_departure_time = arrival_time;
             f32 earliest_arrival_time = earliest_departure_time + neighbour_cost;
@@ -930,23 +662,16 @@ sipp(MemoryArena* memory_arena,
             f32 latest_arrival_time = latest_departure_time + neighbour_cost;
             SafeInterval arrival_interval = {earliest_arrival_time, latest_arrival_time};
 
-            for (u32 vertex_interval_index = 0;
-                 vertex_interval_index < safe_intervals_vertex_count[neighbour_to];
-                 vertex_interval_index++)
+            for (SafeInterval vertex_interval : safe_intervals_vertex[neighbour_to])
             {
-                SafeInterval vertex_interval = safe_intervals_vertex[neighbour_to][vertex_interval_index];
                 SafeInterval safe_arrival_interval_vertex = intersection(arrival_interval, vertex_interval);
                 if (interval_exists(safe_arrival_interval_vertex))
                 {
                     SafeInterval safe_departure_interval_vertex = {safe_arrival_interval_vertex.start - neighbour_cost,
                                                                    safe_arrival_interval_vertex.end - neighbour_cost};
                     u32 edge_index = get_edge_index(graph->vertex_count, current_vertex,  neighbour_to);
-                    for (u32 edge_interval_index = 0;
-                         edge_interval_index < safe_intervals_edge_count[edge_index];
-                         edge_interval_index++)
-                    {
-                        SafeInterval edge_interval = safe_intervals_edge[edge_index][edge_interval_index];
-                            
+                    for (SafeInterval edge_interval : safe_intervals_edge[edge_index])
+                    {                            
                         SafeInterval safe_arrival_interval_edge = intersection(safe_arrival_interval_vertex, edge_interval);
                         SafeInterval safe_departure_interval_edge = intersection(safe_departure_interval_vertex, edge_interval);
 
@@ -1004,50 +729,36 @@ struct Solution
 };
 
 static ComputeSafeIntervalsResult
-compute_safe_intervals(MemoryArena* memory_arena, Graph* graph, Constraint* constraints, u32 constraint_count)
+compute_safe_intervals(Graph* graph, std::vector<Constraint> constraints)
 {
     ComputeSafeIntervalsResult result;
     
     u32 safe_intervals_vertex_size = graph->vertex_count;
-    SafeIntervalCold** safe_intervals_vertex_cold = push_array(memory_arena, SafeIntervalCold*, safe_intervals_vertex_size);
-    u32* safe_intervals_vertex_count = push_array(memory_arena, u32, safe_intervals_vertex_size);
-    for (u32 vertex_index = 0;
-         vertex_index < safe_intervals_vertex_size;
-         vertex_index++)
+    result.safe_intervals_vertex.resize(safe_intervals_vertex_size);
+    for (u32 safe_interval_index = 0;
+         safe_interval_index < safe_intervals_vertex_size;
+         safe_interval_index++)
     {
-        safe_intervals_vertex_cold[vertex_index] = push_struct(memory_arena, SafeIntervalCold);
-        safe_intervals_vertex_cold[vertex_index]->interval.start = 0;
-        safe_intervals_vertex_cold[vertex_index]->interval.end = INF;
-        safe_intervals_vertex_count[vertex_index] = 1;
+        result.safe_intervals_vertex[safe_interval_index].push_back({0, INF});
     }
-
     u32 safe_intervals_edge_size = graph->vertex_count * graph->vertex_count;
-    SafeIntervalCold** safe_intervals_edge_cold = push_array(memory_arena, SafeIntervalCold*, safe_intervals_edge_size);
-    u32* safe_intervals_edge_count = push_array(memory_arena, u32, safe_intervals_edge_size);
-    for (u32 edge_index = 0;
-         edge_index < safe_intervals_edge_size;
-         edge_index++)
+    result.safe_intervals_edge.resize(safe_intervals_edge_size);
+    for (u32 safe_interval_index = 0;
+         safe_interval_index < safe_intervals_edge_size;
+         safe_interval_index++)
     {
-        safe_intervals_edge_cold[edge_index] = push_struct(memory_arena, SafeIntervalCold);
-        safe_intervals_edge_cold[edge_index]->interval.start = 0;
-        safe_intervals_edge_cold[edge_index]->interval.end = INF;
-        safe_intervals_edge_count[edge_index] = 1;
+        result.safe_intervals_edge[safe_interval_index].push_back({0, INF});
     }
-
-    for (u32 constraint_index = 0;
-         constraint_index < constraint_count;
-         constraint_index++)
+    
+    for (Constraint constraint : constraints)
     {
-        Constraint constraint = constraints[constraint_index];
-
         // TODO: ta bort kollisions-intervallet från safe intervals
         if (constraint.type == ACTION_TYPE_WAIT)
         {
             u32 vertex_index = constraint.from;
             Interval interval = constraint.interval;
                 
-            SafeIntervalCold* iter2 = safe_intervals_vertex_cold[vertex_index];
-            safe_intervals_vertex_cold[vertex_index] = remove_interval(memory_arena, iter2, interval, safe_intervals_vertex_count, vertex_index);
+            remove_interval(result.safe_intervals_vertex[vertex_index], interval);
         }
         else if (constraint.type == ACTION_TYPE_MOVE)
         {
@@ -1057,60 +768,10 @@ compute_safe_intervals(MemoryArena* memory_arena, Graph* graph, Constraint* cons
 
             u32 edge_index = get_edge_index(graph->vertex_count, from_vertex_index, to_vertex_index);
                 
-            SafeIntervalCold* iter2 = safe_intervals_edge_cold[edge_index];
-            safe_intervals_edge_cold[edge_index] = remove_interval(memory_arena, iter2, interval, safe_intervals_edge_count, edge_index);
+            remove_interval(result.safe_intervals_edge[edge_index], interval);
         }
     };
 
-    SafeInterval** safe_intervals_vertex = push_array(memory_arena, SafeInterval*, safe_intervals_vertex_size);
-    for (u32 vertex_index = 0;
-         vertex_index < safe_intervals_vertex_size;
-         vertex_index++)
-    {
-        u32 safe_interval_count = safe_intervals_vertex_count[vertex_index];
-        if (safe_interval_count > 0)
-        {
-            safe_intervals_vertex[vertex_index] = push_array(memory_arena, SafeInterval, safe_interval_count);
-            SafeIntervalCold* iter = safe_intervals_vertex_cold[vertex_index];
-            u32 safe_interval_index = 0;
-            while (iter)
-            {
-                if (interval_exists(iter->interval))
-                {
-                    safe_intervals_vertex[vertex_index][safe_interval_index++] = iter->interval;
-                }
-                iter = iter->next;
-            }
-        }
-    }
-    
-    SafeInterval** safe_intervals_edge = push_array(memory_arena, SafeInterval*, safe_intervals_edge_size);
-    for (u32 edge_index = 0;
-         edge_index < safe_intervals_edge_size;
-         edge_index++)
-    {
-        u32 safe_interval_count = safe_intervals_edge_count[edge_index];
-        if (safe_interval_count > 0)
-        {
-            safe_intervals_edge[edge_index] = push_array(memory_arena, SafeInterval, safe_interval_count);
-            SafeIntervalCold* iter = safe_intervals_edge_cold[edge_index];
-            u32 safe_interval_index = 0;
-            while (iter)
-            {
-                if (interval_exists(iter->interval))
-                {
-                    safe_intervals_edge[edge_index][safe_interval_index++] = iter->interval;
-                }
-                iter = iter->next;
-            }
-        }
-    }
-
-    result.safe_intervals_vertex = safe_intervals_vertex;
-    result.safe_intervals_vertex_count = safe_intervals_vertex_count;
-    result.safe_intervals_edge = safe_intervals_edge;
-    result.safe_intervals_edge_count = safe_intervals_edge_count;
-    
     return result;
 }
 
@@ -1189,20 +850,6 @@ add_cbs_node(MemoryArena* memory_arena, CBSQueue* queue, CBSNode* node)
         {
             iter_prev->next = next;
         }
-#if 0
-        CBSQueue* next = push_struct(memory_arena, CBSQueue);
-        next->node = node;
-        next->is_used = true;
-        CBSQueue* iter = queue;
-        while (iter->next &&
-               node.cost > iter->node.cost)
-        {
-            iter = iter->next;
-        }
-        CBSQueue* iter_next = iter->next;
-        iter->next = next;
-        next->next = iter_next;
-#endif
     }
 
     return queue;
@@ -1232,7 +879,18 @@ create_action_intervals(SIPPNode vertex, b32 last_vertex,
     }
     else
     {
-        departure_time_vertex = next_vertex.arrival_time - 1;
+        std::vector<Edge> neighbours = graph->vertices[vertex.vertex].edges;
+        f32 edge_cost = -1;
+        for (Edge neighbour : neighbours)
+        {
+            if (neighbour.to == next_vertex.vertex)
+            {
+                edge_cost = neighbour.cost;
+                break;
+            }
+        }
+        Assert(edge_cost > 0);
+        departure_time_vertex = next_vertex.arrival_time - edge_cost;
         leave_time_vertex = next_vertex.arrival_time;
     }
     result.wait = {arrival_time_vertex, departure_time_vertex};
@@ -1386,64 +1044,47 @@ struct MakeConstraintResult
     u32 count;
 };
     
-static MakeConstraintResult
-make_constraints(MemoryArena* memory_arena, CBSNode* node, u32 agent_id)
+static std::vector<Constraint>
+make_constraints(CBSNode* node, u32 agent_id)
 {
-    MakeConstraintResult result;
+    std::vector<Constraint> result;
 
-    u32 constraint_count = 0;
     CBSNode* p = node;
     while (p->parent)
     {
         if (p->constraint.agent_id == agent_id)
         {
-            constraint_count++;
+            result.push_back(p->constraint);
         }
         p = p->parent;
     }
-    Constraint* constraints = push_array(memory_arena, Constraint, constraint_count);
-
-    p = node;
-    u32 constraint_index = 0;
-    while (p->parent)
-    {
-        if (p->constraint.agent_id == agent_id)
-        {
-            constraints[constraint_index++] = p->constraint;
-        }
-        p = p->parent;
-    }
-
-    result.data = constraints;
-    result.count = constraint_count;
 
     return result;
 }
 
-#if SIMULATOR_DEBUG
+#if 0
 global_variable u32 max_visited = 100000;
 global_variable u32* visited_count;
 global_variable MakeConstraintResult** visited;
 #endif
 
 static b32
-constraint_sets_equal(MemoryArena* memory_arena,
-                      MakeConstraintResult set_1, MakeConstraintResult set_2)
+constraint_sets_equal(std::vector<Constraint> set_1, std::vector<Constraint> set_2)
 {
     b32 result = false;
     
-    if (set_1.count == set_2.count)
+    if (set_1.size() == set_2.size())
     {
-        PushTemporaryBlock(memory_arena, checked);
-        u32* checked = push_array(memory_arena, u32, set_1.count);
+        std::vector<u32> checked;
+        checked.resize(set_1.size());
         for (u32 constraint_index = 0;
-             constraint_index < set_1.count;
+             constraint_index < set_1.size();
              constraint_index++)
         {
             if (!checked[constraint_index])
             {
-                Constraint c1 = set_1.data[constraint_index];
-                Constraint c2 = set_2.data[constraint_index];
+                Constraint c1 = set_1[constraint_index];
+                Constraint c2 = set_2[constraint_index];
                 if (constraints_equal(c1, c2))
                 {
                     checked[constraint_index] = true;
@@ -1453,7 +1094,7 @@ constraint_sets_equal(MemoryArena* memory_arena,
 
         result = true;
         for (u32 constraint_index = 0;
-             constraint_index < set_1.count;
+             constraint_index < set_1.size();
              constraint_index++)
         {
             if (!checked[constraint_index])
@@ -1462,14 +1103,13 @@ constraint_sets_equal(MemoryArena* memory_arena,
                 break;
             }
         }
-        PopTemporaryBlock(memory_arena, checked);
     }
 
     return result;
 }
 
 static CBSNode*
-create_cbs_node(MemoryArena* memory_arena, CBSNode* node,
+create_cbs_node(MemoryArena* memory_arena, CBSNode* node, std::vector<std::vector<std::vector<Constraint>>> visited,
                 Constraint constraint, Graph* graph, AgentInfo* agents,
                 Path* path_buffer, u32 agent_count, u32 agent_id)
 {
@@ -1477,24 +1117,22 @@ create_cbs_node(MemoryArena* memory_arena, CBSNode* node,
     
     b32 node_1_ok = true;
     f32 cost_1 = 0;
-    // TODO: fix memory leak here
-    CBSNode* node_1_tmp = push_struct(memory_arena, CBSNode);
-    node_1_tmp->parent = node;
-    node_1_tmp->constraint = constraint;
-    MakeConstraintResult constraints = make_constraints(memory_arena, node_1_tmp, agent_id);
-    for (u32 constraint_set_index = 0;
-         constraint_set_index < visited_count[agent_id];
-         constraint_set_index++)
+
+    CBSNode node_1_tmp;
+    node_1_tmp.parent = node;
+    node_1_tmp.constraint = constraint;
+    std::vector<Constraint> constraints = make_constraints(&node_1_tmp, agent_id);
+    for (std::vector<Constraint> constraint_set : visited[agent_id])
     {
-        if (constraint_sets_equal(memory_arena, visited[agent_id][constraint_set_index], constraints))
+        if (constraint_sets_equal(constraint_set, constraints))
         {
             node_1_ok = false;
             break;
         }
     }
-    visited[agent_id][visited_count[agent_id]++] = constraints;
+    visited[agent_id].push_back(constraints);
     
-    ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, constraints.data, constraints.count);
+    ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
     PushTemporaryBlock(memory_arena, tmp);
     
@@ -1540,32 +1178,15 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
     queue = add_cbs_node(memory_arena, queue, root);
     u32 queue_count = 1;
 
-    visited_count = push_array(memory_arena, u32, agent_count);
-    visited = push_array(memory_arena, MakeConstraintResult*, agent_count);
-    for (u32 i = 0; i < agent_count; i++)
-    {
-        visited_count[i] = 0;
-        visited[i] = push_array(memory_arena, MakeConstraintResult, max_visited);
-    }
-    
+    std::vector<std::vector<std::vector<Constraint>>> visited;
+    visited.resize(agent_count);
     while (queue_count > 0)
     {
-#if 1
-        {
-            size_t tmp_used = memory_arena->used;
-            CBSQueue* p = queue;
-            CBSNode* _queue = push_array(memory_arena, CBSNode, queue_count);
-            u32 i = 0;
-            while (p) { _queue[i++] = *p->node; p = p->next; }
-            memory_arena->used = tmp_used;
-        }
-#endif
-        
         CBSNode* current_node = queue->node;
         queue = queue->next;
         queue_count--;
-        
-        size_t tmp_used = memory_arena->used;
+
+        PushTemporaryBlock(memory_arena, tmp);
         Path* path_buffer = push_array(memory_arena, Path, agent_count);
 
         b32 all_paths_valid = true;
@@ -1574,19 +1195,19 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
              agent_index < agent_count;
              agent_index++)
         {
-            MakeConstraintResult constraints = make_constraints(memory_arena, current_node, agent_index);
-            ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(memory_arena, graph, constraints.data, constraints.count);
+            std::vector<Constraint> constraints = make_constraints(current_node, agent_index);
+            ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
             path_buffer[agent_index] = sipp(memory_arena, graph,
                                             agents[agent_index].start,
                                             agents[agent_index].goal,
                                             h, safe_intervals);
-            path_costs[agent_index] = cost_path(path_buffer[agent_index]);
             if (path_buffer[agent_index].vertex_count == 0)
             {
                 all_paths_valid = false;
                 break;
             }
+            path_costs[agent_index] = cost_path(path_buffer[agent_index]);
         }
 
         if (all_paths_valid)
@@ -1601,7 +1222,7 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
             Constraint constraint_1 =  {new_conflict.interval,
                                         new_conflict.agent_1_id, new_conflict.action_1.type,
                                         new_conflict.action_1.move.from, new_conflict.action_1.move.to};
-            CBSNode* node_1 = create_cbs_node(memory_arena, current_node,
+            CBSNode* node_1 = create_cbs_node(memory_arena, current_node, visited,
                                               constraint_1, graph, agents,
                                               path_buffer, agent_count, new_conflict.agent_1_id);
             if (node_1)
@@ -1613,7 +1234,7 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
             Constraint constraint_2 =  {new_conflict.interval,
                                         new_conflict.agent_2_id, new_conflict.action_2.type,
                                         new_conflict.action_2.move.from, new_conflict.action_2.move.to};
-            CBSNode* node_2 = create_cbs_node(memory_arena, current_node,
+            CBSNode* node_2 = create_cbs_node(memory_arena, current_node, visited,
                                               constraint_2, graph, agents,
                                               path_buffer, agent_count, new_conflict.agent_2_id);
             if (node_2)
@@ -1624,7 +1245,7 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
         }
         else
         {
-            memory_arena->used = tmp_used;
+            PopTemporaryBlock(memory_arena, tmp);
         }
     }
     
@@ -1666,7 +1287,7 @@ load_graph(MemoryArena* memory_arena, const char* filename)
     u32 parsed_agents = 0;
 
     graph->vertex_count = vertex_count;
-    graph->vertices = push_array(memory_arena, Vertex, vertex_count);
+    graph->vertices.resize(vertex_count);
     graph_result.agents = push_array(memory_arena, AgentInfo, agent_count);
     graph_result.agent_count = agent_count;
         
@@ -1712,24 +1333,24 @@ load_graph(MemoryArena* memory_arena, const char* filename)
                 while(graph_raw[graph_raw_index++] != ')');
                 skip_whitespace(&graph_raw_index, graph_raw);
 
-                vertex->edges = push_struct(memory_arena, LinkedList);
+                /* vertex->edges ; */
                 while(graph_raw[graph_raw_index] != ';')
                 {
                     while(graph_raw[graph_raw_index++] != ',');
                     skip_whitespace(&graph_raw_index, graph_raw);
                     Assert(graph_raw[graph_raw_index] == 'n');
                     graph_raw_index++;
-                    Edge* edge = push_struct(memory_arena, Edge);
+                    Edge edge;
                     StringToU32Result edge_parse = string_to_u32(graph_raw, graph_raw_index);
-                    edge->to = edge_parse.number;
+                    edge.to = edge_parse.number;
                     graph_raw_index += edge_parse.length;
 
                     while(graph_raw[graph_raw_index++] != ':');
                     StringToU32Result cost_parse = string_to_u32(graph_raw, graph_raw_index);
-                    edge->cost = (f32)cost_parse.number;
+                    edge.cost = (f32)cost_parse.number;
                     graph_raw_index += cost_parse.length;
                     
-                    vertex->edges->add(memory_arena, (u8*)edge, sizeof(Edge));
+                    vertex->edges.push_back(edge);
                     skip_whitespace(&graph_raw_index, graph_raw);
                 }
                 
