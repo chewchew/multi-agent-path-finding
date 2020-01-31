@@ -54,63 +54,6 @@ skip_whitespace(u32* i, char* str){  while(IsWhitespace(str[*i])) *i = *i + 1; i
 #define CLOCK_END(ID) clock##ID += __rdtsc() - start##ID;
 #endif
 
-struct MemoryArena
-{
-    size_t size;
-    u8* base;
-    size_t used;
-};
-
-static void
-initialize_arena(MemoryArena* arena, size_t size, u8* base)
-{
-    arena->size = size;
-    arena->base = base;
-    arena->used = 0;
-}
-
-#define zero_struct(struct_instance) zero_size(sizeof(struct_instance), &(struct_instance))
-inline void
-zero_size(size_t size_bytes, void* ptr)
-{
-    u8* byte = (u8*)ptr;
-    while(size_bytes > 0)
-    {
-        *byte++ = 0;
-        size_bytes--;
-    }
-}
-
-#define push_size(arena, size)_push(arena, size)
-#define push_array(arena, type, count)(type*)push_size(arena, sizeof(type) * count)
-#define push_struct(arena, type) (type*)_push(arena, sizeof(type))
-static void*
-_push(MemoryArena* arena, size_t size, size_t alignment = 4)
-{
-    size_t result_pointer = (size_t)arena->base + arena->used;
-    
-    size_t alignment_offset = 0;
-    
-    size_t alignment_mask = alignment - 1;
-    if (result_pointer & alignment_mask)
-    {
-        alignment_offset = alignment - result_pointer & alignment_mask;
-    }
-    size += alignment_offset;
-    
-    Assert(arena->used + size <= arena->size);
-    arena->used += size;
-
-    void* result = (void*)(result_pointer + alignment_offset);
-
-    zero_size(size, result);
-    
-    return result;
-}
-
-#define PushTemporaryBlock(memory_arena, id) u32 tmp##id = memory_arena->used
-#define PopTemporaryBlock(memory_arena, id) memory_arena->used = tmp##id
-
 inline u32
 safe_truncate_size_64(u64 value)
 {
@@ -214,7 +157,6 @@ struct Vertex
 
 struct Graph
 {
-    u32 vertex_count;
     std::vector<Vertex> vertices;
 };
 
@@ -259,6 +201,7 @@ struct Interval
 
 typedef Interval SafeInterval;
 #define INF 10000000
+#define MAX_QUEUE_SIZE 100000
 
 static b32
 intersect(Interval i1, Interval i2)
@@ -365,6 +308,7 @@ constraints_equal(Constraint c1, Constraint c2)
 
 struct CBSNode
 {
+    b32 valid;
     CBSNode* parent;
     Constraint constraint;
     f32 cost;
@@ -374,12 +318,6 @@ struct CBSNode
         {
             return node_1->cost < node_2->cost;
         }
-};
-
-struct Path
-{
-    u32 vertex_count;
-    SIPPNode* vertices;
 };
 
 struct SIPPQueue
@@ -397,69 +335,32 @@ struct CBSQueue
     b32 is_used;
 };
 
-static SIPPQueue*
-add_astar_node(MemoryArena* memory_arena, SIPPQueue* queue, SIPPNode* node)
+static void
+add_astar_node(std::list<SIPPNode*>& queue, SIPPNode* node)
 {
-    if (!queue)
+    auto it = queue.begin();
+    while (it != queue.end())
     {
-        queue = push_struct(memory_arena, SIPPQueue);
-    }
-
-    if (!queue->is_used)
-    {
-        queue->node = node;
-        queue->is_used = true;
-    }
-    else
-    {
-        SIPPQueue* next = push_struct(memory_arena, SIPPQueue);
-        next->node = node;
-        next->is_used = true;
-
-        SIPPQueue* iter_prev = queue;
-        SIPPQueue* iter = queue;
-        while (iter && node->fscore >= iter->node->fscore)
+        if (node->fscore < (*it)->fscore)
         {
-            iter_prev = iter;
-            iter = iter->next;
+            break;
         }
-
-        if (iter)
-        {
-            if (iter == queue)
-            {
-                next->next = queue;
-                queue = next;
-            }
-            else
-            {
-                SIPPQueue* tmp = iter_prev->next;
-                iter_prev->next = next;
-                next->next = tmp;
-            }
-        }
-        else
-        {
-            iter_prev->next = next;
-        }
+        ++it;
     }
-    
-    return queue;
+    queue.insert(it, node);
 }
 
-static SIPPNode*
-create_sipp_node(MemoryArena* memory_arena,
+static void
+create_sipp_node(SIPPNode* new_node,
                  SIPPNode* parent, u32 vertex,
                  f32 earliest_arrival_time, f32 safe_interval_end,
                  f32 move_time, f32 hvalue)
 {
-    SIPPNode* new_node = push_struct(memory_arena, SIPPNode);
     new_node->parent = parent;
     new_node->vertex = vertex;
     new_node->arrival_time = earliest_arrival_time;
     new_node->safe_interval_end = safe_interval_end;
     new_node->fscore = earliest_arrival_time + hvalue;
-    return new_node;
 }
 
 struct TimeNode
@@ -570,51 +471,50 @@ get_edge_index(u32 vertex_count, u32 from, u32 to)
     return vertex_count * from + to;
 }
 
-static Path
-sipp(MemoryArena* memory_arena,
-     Graph* graph,
+#define GetNode(pool_id, count) &pool_id[count++]
+
+static std::vector<SIPPNode>
+sipp(Graph* graph,
      u32 start, u32 goal,
      f32 (*heuristic)(Graph*, u32, u32),
      ComputeSafeIntervalsResult safe_intervals)
 {
     std::vector<std::vector<SafeInterval>> safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
     std::vector<std::vector<SafeInterval>> safe_intervals_edge = safe_intervals.safe_intervals_edge;
+    SIPPNode* node_pool = (SIPPNode*)malloc(sizeof(SIPPNode) * MAX_QUEUE_SIZE);
+    u32 nodes_in_use = 0;
     
-    Path result = {};
+    std::vector<SIPPNode> result;
 
-    u32 queue_count = 0;
-    SIPPQueue* queue = 0;
-    SIPPNode* root = push_struct(memory_arena, SIPPNode);
-    root->vertex = start;
-    root->arrival_time = 0;
+    std::list<SIPPNode*> queue;
+    SIPPNode* root = GetNode(node_pool, nodes_in_use);
+    f32 root_safe_interval_end = safe_intervals_vertex[start][0].end;
     if (safe_intervals_vertex[start][0].start > 0)
     {
-        root->safe_interval_end = 0;
+        root_safe_interval_end = 0;
     }
-    else
-    {
-        root->safe_interval_end = safe_intervals_vertex[start][0].end;
-    }
-    root->fscore = heuristic(graph, start, goal);
+    create_sipp_node(root,
+                     0, start,
+                     0, root_safe_interval_end,
+                     0, heuristic(graph, start, goal));
+    add_astar_node(queue, root);
+    
 
-    queue = add_astar_node(memory_arena, queue, root);
-    queue_count++;
-
-    TimeNode** visited = push_array(memory_arena, TimeNode*, graph->vertex_count);
-
+    std::vector<std::vector<f32>> visited;
+    visited.resize(graph->vertices.size());
+    
     u32 expansions = 0;
-    while(queue_count > 0)
+    while(queue.size() > 0)
     {        
         expansions++;
-        SIPPNode* current_node = queue->node;
-        queue = queue->next;;
-        queue_count--;
+        SIPPNode* current_node = queue.front();
+        queue.pop_front();
         
         u32 current_vertex = current_node->vertex;
         f32 arrival_time = current_node->arrival_time;
         f32 safe_interval_end = current_node->safe_interval_end;
         
-        Assert(current_vertex < graph->vertex_count);
+        Assert(current_vertex < graph->vertices.size());
         
         if (current_vertex == goal && can_wait_forever(safe_intervals_vertex[current_vertex], arrival_time))
         {
@@ -633,14 +533,12 @@ sipp(MemoryArena* memory_arena,
                 prev = next;
             }
             
-            result.vertex_count = path_length;
-            result.vertices = push_array(memory_arena, SIPPNode, result.vertex_count);//(SIPPNode*)malloc(sizeof(SIPPNode) * result.vertex_count);
             next = current_node;
             for (u32 vertex_index = 0;
                  vertex_index < path_length;
                  vertex_index++)
             {
-                result.vertices[vertex_index] = path[result.vertex_count - 1 - vertex_index];
+                result.push_back(path[path_length - 1 - vertex_index]);
             }
             
             break;
@@ -648,13 +546,10 @@ sipp(MemoryArena* memory_arena,
 
         std::vector<Edge> neighbours = graph->vertices[current_vertex].edges;
         for (Edge edge : neighbours)
-        /* while (current_neighbour && !current_neighbour->empty()) */
         {
-            /* Edge* edge = (Edge*)current_neighbour->data; */
             f32 neighbour_cost = edge.cost;
             u32 neighbour_to = edge.to;
             f32 hvalue = heuristic(graph, neighbour_to, goal);
-            /* current_neighbour = current_neighbour->next; */
 
             f32 earliest_departure_time = arrival_time;
             f32 earliest_arrival_time = earliest_departure_time + neighbour_cost;
@@ -669,7 +564,7 @@ sipp(MemoryArena* memory_arena,
                 {
                     SafeInterval safe_departure_interval_vertex = {safe_arrival_interval_vertex.start - neighbour_cost,
                                                                    safe_arrival_interval_vertex.end - neighbour_cost};
-                    u32 edge_index = get_edge_index(graph->vertex_count, current_vertex,  neighbour_to);
+                    u32 edge_index = get_edge_index(graph->vertices.size(), current_vertex,  neighbour_to);
                     for (SafeInterval edge_interval : safe_intervals_edge[edge_index])
                     {                            
                         SafeInterval safe_arrival_interval_edge = intersection(safe_arrival_interval_vertex, edge_interval);
@@ -693,19 +588,17 @@ sipp(MemoryArena* memory_arena,
                             continue;
                         }
 
-                        if (!has_visited(visited[neighbour_to], earliest_arrival_time))
+                        auto el = std::find(visited[neighbour_to].begin(), visited[neighbour_to].end(), earliest_arrival_time);
+                        if (el == visited[neighbour_to].end())
                         {
-                            SIPPNode* new_node = create_sipp_node(memory_arena, current_node, neighbour_to,
-                                                                  earliest_arrival_time, vertex_interval.end,
-                                                                  neighbour_cost, hvalue);
-                            queue = add_astar_node(memory_arena, queue, new_node);
-                            queue_count++;
+                            SIPPNode* new_node = GetNode(node_pool, nodes_in_use);
+                            create_sipp_node(new_node,
+                                             current_node, neighbour_to,
+                                             earliest_arrival_time, vertex_interval.end,
+                                             neighbour_cost, hvalue);
+                            add_astar_node(queue, new_node);
 
-                            
-                            TimeNode* time_node = push_struct(memory_arena, TimeNode);
-                            time_node->next = visited[neighbour_to];
-                            time_node->time = earliest_arrival_time;
-                            visited[neighbour_to] = time_node;
+                            visited[neighbour_to].push_back(earliest_arrival_time);
                         }
                     }
                 }
@@ -713,18 +606,21 @@ sipp(MemoryArena* memory_arena,
         }
     }
 
+    free(node_pool);
+    
     return result;
 }
 
 struct AgentInfo
 {
+    u32 id;
     u32 start;
     u32 goal;
 };
 
 struct Solution
 {
-    Path* paths;
+    std::vector<std::vector<SIPPNode>> paths;
     u32 path_count;
 };
 
@@ -733,7 +629,7 @@ compute_safe_intervals(Graph* graph, std::vector<Constraint> constraints)
 {
     ComputeSafeIntervalsResult result;
     
-    u32 safe_intervals_vertex_size = graph->vertex_count;
+    u32 safe_intervals_vertex_size = graph->vertices.size();
     result.safe_intervals_vertex.resize(safe_intervals_vertex_size);
     for (u32 safe_interval_index = 0;
          safe_interval_index < safe_intervals_vertex_size;
@@ -741,7 +637,7 @@ compute_safe_intervals(Graph* graph, std::vector<Constraint> constraints)
     {
         result.safe_intervals_vertex[safe_interval_index].push_back({0, INF});
     }
-    u32 safe_intervals_edge_size = graph->vertex_count * graph->vertex_count;
+    u32 safe_intervals_edge_size = graph->vertices.size() * graph->vertices.size();
     result.safe_intervals_edge.resize(safe_intervals_edge_size);
     for (u32 safe_interval_index = 0;
          safe_interval_index < safe_intervals_edge_size;
@@ -766,7 +662,7 @@ compute_safe_intervals(Graph* graph, std::vector<Constraint> constraints)
             u32 to_vertex_index = constraint.to;
             Interval interval = constraint.interval;
 
-            u32 edge_index = get_edge_index(graph->vertex_count, from_vertex_index, to_vertex_index);
+            u32 edge_index = get_edge_index(graph->vertices.size(), from_vertex_index, to_vertex_index);
                 
             remove_interval(result.safe_intervals_edge[edge_index], interval);
         }
@@ -784,75 +680,37 @@ f32 h(Graph* g, u32 vertex, u32 goal)
 }        
 
 static f32
-cost_path(Path path)
+cost_path(std::vector<SIPPNode> path)
 {
-    return path.vertices[path.vertex_count - 1].arrival_time;
+    return path[path.size() - 1].arrival_time;
 }
 
 static f32
-cost(Path* paths, u32 agent_count)
+cost(std::vector<std::vector<SIPPNode>> paths)
 {
     f32 result = 0;
 
-    for (u32 path_index = 0;
-         path_index < agent_count;
-         path_index++)
+    for (std::vector<SIPPNode> path : paths)
     {
-        Path path = paths[path_index];
-        result += cost_path(paths[path_index]);
+        result += cost_path(path);
     }
     
     return result;
 }
 
-static CBSQueue*
-add_cbs_node(MemoryArena* memory_arena, CBSQueue* queue, CBSNode* node)
+static void
+add_cbs_node(std::list<CBSNode*>& queue, CBSNode* node)
 {
-    if (!queue)
+    auto it = queue.begin();
+    while (it != queue.end())
     {
-        queue = push_struct(memory_arena, CBSQueue);
-    }
-
-    if (!queue->is_used)
-    {
-        queue->node = node;
-        queue->is_used = true;
-    }
-    else
-    {
-        CBSQueue* next = push_struct(memory_arena, CBSQueue);
-        next->node = node;
-        next->is_used = true;
-
-        CBSQueue* iter_prev = queue;
-        CBSQueue* iter = queue;
-        while (iter && node->cost >= iter->node->cost)
+        if (node->cost < (*it)->cost)
         {
-            iter_prev = iter;
-            iter = iter->next;
+            break;
         }
-
-        if (iter)
-        {
-            if (iter == queue)
-            {
-                next->next = queue;
-                queue = next;
-            }
-            else
-            {
-                CBSQueue* tmp = iter_prev->next;
-                iter_prev->next = next;
-                next->next = tmp;
-            }
-        }
-        else
-        {
-            iter_prev->next = next;
-        }
+        ++it;
     }
-
-    return queue;
+    queue.insert(it, node);
 }
 
 struct ActionIntervals
@@ -906,37 +764,38 @@ struct FindConflictResult
 };
 
 static FindConflictResult
-find_conflict(Path* path_buffer, u32 agent_count, Graph* graph)
+find_conflict(std::vector<std::vector<SIPPNode>> path_buffer, Graph* graph)
 {
     FindConflictResult result = {};
     result.no_conflict_found = true;
-    
+
+    u32 agent_count = path_buffer.size();
     for (u32 agent_index = 0;
          agent_index < agent_count && result.no_conflict_found;
          agent_index++)
     {
-        Path path = path_buffer[agent_index];
+        std::vector<SIPPNode> path = path_buffer[agent_index];
         for (u32 vertex_index = 0;
-             vertex_index < path.vertex_count && result.no_conflict_found;
+             vertex_index < path.size() && result.no_conflict_found;
              vertex_index++)
         {
-            SIPPNode vertex = path.vertices[vertex_index];
-            SIPPNode next_vertex = path.vertices[(vertex_index + 1) % path.vertex_count];
-            b32 last_vertex = vertex_index == path.vertex_count - 1;
+            SIPPNode vertex = path[vertex_index];
+            SIPPNode next_vertex = path[(vertex_index + 1) % path.size()];
+            b32 last_vertex = vertex_index == path.size() - 1;
             ActionIntervals action_intervals_vertex = create_action_intervals(vertex, last_vertex, next_vertex, graph);
             
             for (u32 other_agent_index = agent_index + 1;
                  other_agent_index < agent_count && result.no_conflict_found;
                  other_agent_index++)
             {
-                Path other_path = path_buffer[other_agent_index];
+                std::vector<SIPPNode> other_path = path_buffer[other_agent_index];
                 for (u32 other_vertex_index = 0;
-                     other_vertex_index < other_path.vertex_count && result.no_conflict_found;
+                     other_vertex_index < other_path.size() && result.no_conflict_found;
                      other_vertex_index++)
                 {
-                    SIPPNode other_vertex = other_path.vertices[other_vertex_index];
-                    SIPPNode next_other_vertex = other_path.vertices[(other_vertex_index + 1) % other_path.vertex_count];
-                    b32 last_other_vertex = other_vertex_index == other_path.vertex_count - 1;
+                    SIPPNode other_vertex = other_path[other_vertex_index];
+                    SIPPNode next_other_vertex = other_path[(other_vertex_index + 1) % other_path.size()];
+                    b32 last_other_vertex = other_vertex_index == other_path.size() - 1;
                     ActionIntervals action_intervals_other_vertex = create_action_intervals(other_vertex, last_other_vertex, next_other_vertex, graph);
 
                     Interval move_move_interval = intersection(action_intervals_vertex.move, action_intervals_other_vertex.move);
@@ -1108,111 +967,90 @@ constraint_sets_equal(std::vector<Constraint> set_1, std::vector<Constraint> set
     return result;
 }
 
-static CBSNode*
-create_cbs_node(MemoryArena* memory_arena, CBSNode* node, std::vector<std::vector<std::vector<Constraint>>> visited,
-                Constraint constraint, Graph* graph, AgentInfo* agents,
-                Path* path_buffer, u32 agent_count, u32 agent_id)
+static void
+create_cbs_node(CBSNode* new_node,
+                CBSNode* parent, std::vector<std::vector<std::vector<Constraint>>> visited,
+                Constraint constraint, Graph* graph, std::vector<AgentInfo> agents,
+                std::vector<std::vector<SIPPNode>> path_buffer, u32 agent_id)
 {
-    CBSNode* result = 0;
-    
-    b32 node_1_ok = true;
-    f32 cost_1 = 0;
-
-    CBSNode node_1_tmp;
-    node_1_tmp.parent = node;
-    node_1_tmp.constraint = constraint;
-    std::vector<Constraint> constraints = make_constraints(&node_1_tmp, agent_id);
+    new_node->parent = parent;
+    new_node->constraint = constraint;
+    std::vector<Constraint> constraints = make_constraints(new_node, agent_id);
     for (std::vector<Constraint> constraint_set : visited[agent_id])
     {
         if (constraint_sets_equal(constraint_set, constraints))
         {
-            node_1_ok = false;
-            break;
+            new_node->valid = false;
+            return;
         }
     }
     visited[agent_id].push_back(constraints);
     
     ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
-    PushTemporaryBlock(memory_arena, tmp);
-    
-    Path path_1 = sipp(memory_arena, graph,
-                       agents[agent_id].start,
-                       agents[agent_id].goal,
-                       h, safe_intervals);
-    if (path_1.vertex_count == 0)
+    std::vector<SIPPNode> new_path = sipp(graph,
+                                        agents[agent_id].start,
+                                        agents[agent_id].goal,
+                                        h, safe_intervals);
+    if (new_path.size() == 0)
     {
-        node_1_ok = false;
-    }
-    else
-    {
-        Path tmp = path_buffer[agent_id];
-        path_buffer[agent_id] = path_1;
-        cost_1 = cost(path_buffer, agent_count);
-        path_buffer[agent_id] = tmp;
+        new_node->valid = false;
+        return;
     }
 
-    PopTemporaryBlock(memory_arena, tmp);
-
-    if (node_1_ok)
-    {
-        result = push_struct(memory_arena, CBSNode);
-        result->parent = node;
-        result->constraint = constraint;
-        result->cost = cost_1;
-    }
-
-    return result;
+    new_node->parent = parent;
+    new_node->constraint = constraint;
+    new_node->cost = cost(path_buffer) - cost_path(path_buffer[agent_id]) + cost_path(new_path);
 }
 
 static Solution
-cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
+cbs(Graph* graph, std::vector<AgentInfo> agents)
 {
     Solution result;
-    result.paths = push_array(memory_arena, Path, agent_count);
-    result.path_count = agent_count;
+    result.paths.resize(agents.size());
 
-    CBSNode* root = push_struct(memory_arena, CBSNode);
-    
-    CBSQueue* queue = 0;
-    queue = add_cbs_node(memory_arena, queue, root);
-    u32 queue_count = 1;
+    CBSNode* node_pool = (CBSNode*)malloc(sizeof(CBSNode) * MAX_QUEUE_SIZE);
+    u32 nodes_in_use = 0;
 
+    std::list<CBSNode*> queue;
     std::vector<std::vector<std::vector<Constraint>>> visited;
-    visited.resize(agent_count);
-    while (queue_count > 0)
-    {
-        CBSNode* current_node = queue->node;
-        queue = queue->next;
-        queue_count--;
+    visited.resize(agents.size());
+    std::vector<std::vector<SIPPNode>> path_buffer;
+    path_buffer.resize(agents.size());
 
-        PushTemporaryBlock(memory_arena, tmp);
-        Path* path_buffer = push_array(memory_arena, Path, agent_count);
+    CBSNode* root = GetNode(node_pool, nodes_in_use);
+    root->valid = true;
+    root->parent = 0;
+    root->constraint = {};
+    root->cost = 0;
+    
+    add_cbs_node(queue, root);
+    
+    while (queue.size() > 0)
+    {
+        CBSNode* current_node = queue.front();
+        queue.pop_front();
 
         b32 all_paths_valid = true;
-        f32* path_costs = push_array(memory_arena, f32, agent_count);
-        for (u32 agent_index = 0;
-             agent_index < agent_count;
-             agent_index++)
+        for (AgentInfo agent : agents)
         {
-            std::vector<Constraint> constraints = make_constraints(current_node, agent_index);
+            std::vector<Constraint> constraints = make_constraints(current_node, agent.id);
             ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
-            path_buffer[agent_index] = sipp(memory_arena, graph,
-                                            agents[agent_index].start,
-                                            agents[agent_index].goal,
-                                            h, safe_intervals);
-            if (path_buffer[agent_index].vertex_count == 0)
+            path_buffer[agent.id] = sipp(graph,
+                                         agent.start,
+                                         agent.goal,
+                                         h, safe_intervals);
+            if (path_buffer[agent.id].size() == 0)
             {
                 all_paths_valid = false;
                 break;
             }
-            path_costs[agent_index] = cost_path(path_buffer[agent_index]);
         }
 
         if (all_paths_valid)
         {
-            FindConflictResult find_conflict_result = find_conflict(path_buffer, agent_count, graph);
+            FindConflictResult find_conflict_result = find_conflict(path_buffer, graph);
             if (find_conflict_result.no_conflict_found)
             {
                 Assert(!"done");
@@ -1222,49 +1060,54 @@ cbs(MemoryArena* memory_arena, Graph* graph, AgentInfo* agents, u32 agent_count)
             Constraint constraint_1 =  {new_conflict.interval,
                                         new_conflict.agent_1_id, new_conflict.action_1.type,
                                         new_conflict.action_1.move.from, new_conflict.action_1.move.to};
-            CBSNode* node_1 = create_cbs_node(memory_arena, current_node, visited,
-                                              constraint_1, graph, agents,
-                                              path_buffer, agent_count, new_conflict.agent_1_id);
+            CBSNode* node_1 = GetNode(node_pool, nodes_in_use);
+            create_cbs_node(node_1,
+                            current_node, visited,
+                            constraint_1, graph, agents,
+                            path_buffer, new_conflict.agent_1_id);
             if (node_1)
             {
-                queue = add_cbs_node(memory_arena, queue, node_1);
-                queue_count++;
+                add_cbs_node(queue, node_1);
+            }
+            else
+            {
+                nodes_in_use--;
             }
             
             Constraint constraint_2 =  {new_conflict.interval,
                                         new_conflict.agent_2_id, new_conflict.action_2.type,
                                         new_conflict.action_2.move.from, new_conflict.action_2.move.to};
-            CBSNode* node_2 = create_cbs_node(memory_arena, current_node, visited,
-                                              constraint_2, graph, agents,
-                                              path_buffer, agent_count, new_conflict.agent_2_id);
+            CBSNode* node_2 = GetNode(node_pool, nodes_in_use);
+            create_cbs_node(node_2,
+                            current_node, visited,
+                            constraint_2, graph, agents,
+                            path_buffer, new_conflict.agent_2_id);
             if (node_2)
             {
-                queue = add_cbs_node(memory_arena, queue, node_2);
-                queue_count++;
+                add_cbs_node(queue, node_2);
+            }
+            else
+            {
+                nodes_in_use--;
             }
         }
-        else
-        {
-            PopTemporaryBlock(memory_arena, tmp);
-        }
     }
+
+    free(node_pool);
     
     return result;
 }
     
 struct GraphData
 {
-    Graph* graph;
-    AgentInfo* agents;
-    u32 agent_count;
+    Graph graph;
+    std::vector<AgentInfo> agents;
 };
 
 static GraphData
-load_graph(MemoryArena* memory_arena, const char* filename)
+load_graph(const char* filename)
 {
     GraphData graph_result;
-    Graph* graph = push_struct(memory_arena, Graph);
-    graph_result.graph = graph;
 
     DebugReadFileResult graph_file = DEBUG_platform_read_entire_file(filename);
     
@@ -1282,14 +1125,12 @@ load_graph(MemoryArena* memory_arena, const char* filename)
     StringToU32Result vertex_count_parse = string_to_u32(graph_raw, graph_raw_index);
     vertex_count = vertex_count_parse.number;
     graph_raw_index += vertex_count_parse.length;
+    graph_result.agents.resize(agent_count);
     
     u32 current_vertex = 0;
     u32 parsed_agents = 0;
 
-    graph->vertex_count = vertex_count;
-    graph->vertices.resize(vertex_count);
-    graph_result.agents = push_array(memory_arena, AgentInfo, agent_count);
-    graph_result.agent_count = agent_count;
+    graph_result.graph.vertices.resize(vertex_count);
         
     for (; graph_raw_index < graph_file.contents_size;
          graph_raw_index++)
@@ -1315,11 +1156,12 @@ load_graph(MemoryArena* memory_arena, const char* filename)
                 graph_result.agents[parsed_agents].goal = vertex_parse.number;
                 graph_raw_index += vertex_parse.length;
                 
+                graph_result.agents[parsed_agents].id = parsed_agents;
                 parsed_agents++;
             }
             else if (graph_raw[graph_raw_index] == 'n')
             {
-                Vertex* vertex = &graph->vertices[current_vertex];
+                Vertex* vertex = &graph_result.graph.vertices[current_vertex];
                 
                 while(graph_raw[graph_raw_index++] != ':');
                 while(graph_raw[graph_raw_index++] != '(');
@@ -1374,16 +1216,11 @@ struct SimulatorState
 };
 
 static void
-simulate(MemoryArena* memory_arena)
+simulate(SimulatorState* simulator_state)
 {
-    SimulatorState* simulator_state = (SimulatorState*)memory_arena->base;
-    
     if (!simulator_state->is_initialized)
     {
-        push_struct(memory_arena, SimulatorState);
-
-        GraphData graph_data = load_graph(memory_arena, "graphs/grid3x3.grid");
-        simulator_state->graph = graph_data.graph;
+        GraphData graph_data = load_graph("graphs/grid3x3.grid");
             
         simulator_state->is_initialized = true;
 
@@ -1437,7 +1274,7 @@ simulate(MemoryArena* memory_arena)
              c1, 0);
         int x = 0;
 #endif
-        Solution solution = cbs(memory_arena, simulator_state->graph, graph_data.agents, graph_data.agent_count);
+        Solution solution = cbs(&graph_data.graph, graph_data.agents);
         /* Constraint* c2 = push_struct(memory_arena, Constraint); */
         /* c2->time = 2; */
         /* c2->vertex = 4; */

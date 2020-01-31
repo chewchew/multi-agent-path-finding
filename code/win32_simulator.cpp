@@ -288,14 +288,6 @@ WinMain(HINSTANCE instance,
             Input* new_input = &inputs[0];
             Input* old_input = &inputs[1];
 
-            u32 memory_size = Megabytes(1000);
-            MemoryArena memory_arena;
-            memory_arena.size = memory_size;
-            memory_arena.base = (u8*)VirtualAlloc(
-                0, memory_size,
-                MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-            memory_arena.used = 0;
-            
             g_running = true;
             while (g_running)
             {
@@ -417,7 +409,8 @@ WinMain(HINSTANCE instance,
                 last_counter = end_counter;
 
                 LARGE_INTEGER start = win32_get_wall_clock();
-                simulate(&memory_arena);
+                SimulatorState simulator_state = {};
+                simulate(&simulator_state);
                 LARGE_INTEGER end = win32_get_wall_clock();
                 f32 time = win32_get_seconds_elapsed(end, start);
 
