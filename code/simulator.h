@@ -1,9 +1,7 @@
-#if SIMULATOR_DEBUG
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#endif
-
 #include <stdint.h>
 #include <vector>
 #include <queue>
@@ -22,7 +20,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
-    
+
 #define global_variable static
 
 #ifdef __linux__
@@ -54,103 +52,18 @@ skip_whitespace(u32* i, char* str){  while(IsWhitespace(str[*i])) *i = *i + 1; i
 #define CLOCK_END(ID) clock##ID += __rdtsc() - start##ID;
 #endif
 
-inline u32
-safe_truncate_size_64(u64 value)
-{
-    Assert(value <= 0xFFFFFFFF);
-    u32 result = (u32)value;
-    return result;
-}
-
-static u32
-char_to_u32(char c)
-{
-    Assert(c >= '0' && c <= '9');
-    return c - '0';
-}
-
-struct StringToU32Result
-{
-    u32 number;
-    u32 length;
-};
-
-static StringToU32Result
-string_to_u32(char* str, u32 from)
-{
-    StringToU32Result result;
-    result.number = 0;
-    
-    u32 start = from;
-    
-    while (str[from] >= '0' && str[from] <= '9')
-    {
-        result.number *= 10;
-        result.number += char_to_u32(str[from]);
-        from++;
-    }
-
-    result.length = from - start;
-    
-    return result;
-}
-
-static u32
-read_string(char* str, u32 from, char* buffer, u32 buffer_size)
-{
-    u32 string_length = 0;
-
-    while (!IsWhitespace(str[from]))
-    {
-        buffer[string_length++] = str[from];
-        from++;
-    }
-    
-    return string_length;
-}
-
-static s32
-contains_u32(u32* array, u32 size, u32 element)
-{
-    s32 result = -1;
-    for (u32 i = 0; i < size; i++) if (array[i] == element) { result = i; break; }
-    return result;
-}
-
-struct DebugReadFileResult
-{
-    u32 contents_size;
-    void* contents;
-};
-
-#define DEBUG_PLATFORM_READ_ENTIRE_FILE(name) DebugReadFileResult name(const char* filename)
-typedef DEBUG_PLATFORM_READ_ENTIRE_FILE(_debug_platform_read_entire_file);
-DEBUG_PLATFORM_READ_ENTIRE_FILE(DEBUG_platform_read_entire_file_stub)
-{
-    DebugReadFileResult result = {};
-    return result;
-}
-global_variable _debug_platform_read_entire_file* DEBUG_platform_read_entire_file_ = DEBUG_platform_read_entire_file_stub;
-#define DEBUG_platform_read_entire_file DEBUG_platform_read_entire_file_
-
-#define DEBUG_PLATFORM_FREE_FILE_MEMORY(name) void name(void* memory)
-typedef DEBUG_PLATFORM_FREE_FILE_MEMORY(_debug_platform_free_file_memory);
-DEBUG_PLATFORM_FREE_FILE_MEMORY(DEBUG_platform_free_file_memory_stub)
-{
-}
-global_variable _debug_platform_free_file_memory* DEBUG_platform_free_file_memory_ = DEBUG_platform_free_file_memory_stub;
-#define DEBUG_platform_free_file_memory DEBUG_platform_free_file_memory_
+#include "vec2.h"
 
 struct Edge
 {
     u32 to;
     f32 cost;
 };
-
+    
 struct Vertex
 {
-    f32 x;
-    f32 y;
+    u32 id;
+    Vec2 position;
     std::vector<f32> speeds;
     std::vector<Edge> edges;
 };
@@ -166,14 +79,8 @@ struct SIPPNode
     f32 arrival_time;
     f32 safe_interval_end;
     f32 fscore;
+    f32 speed;
     SIPPNode* parent;
-
-    constexpr b32
-    operator()(const SIPPNode*& node_1, const SIPPNode*& node_2) const 
-        {
-            return node_1->fscore < node_2->fscore;
-        }
-
 };
 
 struct WaitConflict
@@ -202,6 +109,8 @@ struct Interval
 typedef Interval SafeInterval;
 #define INF 10000000
 #define MAX_QUEUE_SIZE 100000
+
+#define UNDEFINED_INTERVAL {INF, INF}
 
 static b32
 intersect(Interval i1, Interval i2)
@@ -312,27 +221,6 @@ struct CBSNode
     CBSNode* parent;
     Constraint constraint;
     f32 cost;
-
-    b32
-    operator()(const CBSNode*& node_1, const CBSNode*& node_2) const 
-        {
-            return node_1->cost < node_2->cost;
-        }
-};
-
-struct SIPPQueue
-{
-    /* SIPPQueue* prev; */
-    SIPPQueue* next;
-    SIPPNode* node;
-    b32 is_used;
-};
-
-struct CBSQueue
-{
-    CBSQueue* next;
-    CBSNode* node;
-    b32 is_used;
 };
 
 static void
@@ -361,6 +249,21 @@ create_sipp_node(SIPPNode* new_node,
     new_node->arrival_time = earliest_arrival_time;
     new_node->safe_interval_end = safe_interval_end;
     new_node->fscore = earliest_arrival_time + hvalue;
+}
+
+static SIPPNode
+create_ds_sipp_node(SIPPNode* parent, u32 vertex,
+                    f32 earliest_arrival_time, f32 safe_interval_end,
+                    f32 move_time, f32 hvalue, f32 speed)
+{
+    SIPPNode new_node;
+    new_node.parent = parent;
+    new_node.vertex = vertex;
+    new_node.arrival_time = earliest_arrival_time;
+    new_node.safe_interval_end = safe_interval_end;
+    new_node.fscore = earliest_arrival_time + hvalue;
+    new_node.speed = speed;
+    return new_node;
 }
 
 struct TimeNode
@@ -473,31 +376,229 @@ get_edge_index(u32 vertex_count, u32 from, u32 to)
 
 #define GetNode(pool_id, count) &pool_id[count++]
 
+static std::vector<SIPPNode*>
+get_successors_sipp(Graph* graph,
+                    SIPPNode* current_node, u32 goal,
+                    f32 (*heuristic)(Graph*, u32, u32),
+                    ComputeSafeIntervalsResult safe_intervals,
+                    std::vector<std::vector<f32>> visited,
+                    std::vector<SIPPNode>& node_pool)
+{
+    std::vector<SIPPNode*> successors;
+    
+    u32 current_vertex = current_node->vertex;
+    f32 arrival_time = current_node->arrival_time;
+    f32 safe_interval_end = current_node->safe_interval_end;
+    std::vector<std::vector<SafeInterval>> safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
+    std::vector<std::vector<SafeInterval>> safe_intervals_edge = safe_intervals.safe_intervals_edge;
+        
+    std::vector<Edge> neighbours = graph->vertices[current_vertex].edges;
+    for (Edge edge : neighbours)
+    {
+        f32 neighbour_cost = edge.cost;
+        u32 neighbour_to = edge.to;
+        f32 hvalue = heuristic(graph, neighbour_to, goal);
+
+        f32 earliest_departure_time = arrival_time;
+        f32 earliest_arrival_time = earliest_departure_time + neighbour_cost;
+        f32 latest_departure_time = safe_interval_end;
+        f32 latest_arrival_time = latest_departure_time + neighbour_cost;
+        SafeInterval arrival_interval = {earliest_arrival_time, latest_arrival_time};
+
+        for (SafeInterval vertex_interval : safe_intervals_vertex[neighbour_to])
+        {
+            SafeInterval safe_arrival_interval_vertex = intersection(arrival_interval, vertex_interval);
+            if (interval_exists(safe_arrival_interval_vertex))
+            {
+                SafeInterval safe_departure_interval_vertex = {safe_arrival_interval_vertex.start - neighbour_cost,
+                                                               safe_arrival_interval_vertex.end - neighbour_cost};
+                u32 edge_index = get_edge_index(graph->vertices.size(), current_vertex,  neighbour_to);
+                for (SafeInterval edge_interval : safe_intervals_edge[edge_index])
+                {                            
+                    SafeInterval safe_arrival_interval_edge = intersection(safe_arrival_interval_vertex, edge_interval);
+                    SafeInterval safe_departure_interval_edge = intersection(safe_departure_interval_vertex, edge_interval);
+
+                    if (!interval_exists(safe_arrival_interval_edge) ||
+                        !interval_exists(safe_departure_interval_edge))
+                    {
+                        continue;
+                    }
+                    else if (in(safe_departure_interval_edge.start + neighbour_cost, safe_arrival_interval_edge))
+                    {
+                        earliest_arrival_time = safe_departure_interval_edge.start + neighbour_cost;
+                    }
+                    else if (in(safe_arrival_interval_edge.start - neighbour_cost, safe_departure_interval_edge))
+                    {
+                        earliest_arrival_time = safe_arrival_interval_edge.start - neighbour_cost;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    auto el = std::find(visited[neighbour_to].begin(), visited[neighbour_to].end(), earliest_arrival_time);
+                    if (el == visited[neighbour_to].end())
+                    {
+                        node_pool.push_back({});
+                        SIPPNode* new_node = &node_pool[node_pool.size() - 1];
+                        create_sipp_node(new_node,
+                                         current_node, neighbour_to,
+                                         earliest_arrival_time, vertex_interval.end,
+                                         neighbour_cost, hvalue);
+                        successors.push_back(new_node);
+                    }
+                }
+            }
+        }
+    }
+
+    return successors;
+}
+
+static b32
+action_possible(Vertex* prev, Vertex current, f32 current_speed, Vertex next, f32 next_speed)
+{
+    if (FloatEq(current_speed, 1) && FloatEq(next_speed, 0))
+    {
+        return false;
+    }
+    else
+    {
+        return true;
+    }
+}
+
+static f32
+action_time(Vertex current, f32 current_speed, Vertex next, f32 next_speed)
+{
+    f32 d = distance(current.position, next.position);
+    return 2 * d / (current_speed + next_speed);
+}
+
+static std::vector<SIPPNode>
+get_successors_ds_sipp(Graph* graph,
+                       SIPPNode* current_node, u32 goal,
+                       f32 (*heuristic)(Graph*, u32, u32),
+                       ComputeSafeIntervalsResult safe_intervals,
+                       std::vector<std::vector<f32>> visited)
+{
+    std::vector<SIPPNode> successors;
+
+    u32 current_vertex_id = current_node->vertex;
+    Vertex current_vertex = graph->vertices[current_vertex_id];
+    f32 current_speed = current_node->speed;
+    Vertex* prev = 0;
+    if (current_node->parent)
+    {
+        prev = &graph->vertices[current_node->parent->vertex];
+    }
+    
+    std::vector<std::vector<SafeInterval>> safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
+    std::vector<std::vector<SafeInterval>> safe_intervals_edge = safe_intervals.safe_intervals_edge;
+        
+    std::vector<Edge> neighbours = current_vertex.edges;
+    for (Edge edge : neighbours)
+    {
+        u32 neighbour_to = edge.to;
+        Vertex neighbour = graph->vertices[neighbour_to];
+        f32 hvalue = heuristic(graph, neighbour_to, goal);
+
+        for (f32 neighbour_speed : neighbour.speeds)
+        {
+            if (action_possible(prev, current_vertex, current_speed, neighbour, neighbour_speed))
+            {
+                f32 neighbour_cost = action_time(current_vertex, current_speed, neighbour, neighbour_speed);
+
+                f32 earliest_departure_time;
+                f32 latest_departure_time;
+                if (FloatEq(current_speed, 0))
+                {
+                    earliest_departure_time = current_node->arrival_time;
+                    latest_departure_time = current_node->safe_interval_end;
+                }
+                else
+                {
+                    earliest_departure_time = latest_departure_time = current_node->arrival_time;
+                }
+                f32 earliest_arrival_time = earliest_departure_time + neighbour_cost;
+                f32 latest_arrival_time = latest_departure_time + neighbour_cost;
+                SafeInterval arrival_interval = {earliest_arrival_time, latest_arrival_time};
+
+                for (SafeInterval vertex_interval : safe_intervals_vertex[neighbour_to])
+                {
+                    SafeInterval safe_arrival_interval_vertex = intersection(arrival_interval, vertex_interval);
+                    if (interval_exists(safe_arrival_interval_vertex))
+                    {
+                        SafeInterval safe_departure_interval_vertex = {safe_arrival_interval_vertex.start - neighbour_cost,
+                                                                       safe_arrival_interval_vertex.end - neighbour_cost};
+                        u32 edge_index = get_edge_index(graph->vertices.size(), current_node->vertex, neighbour_to);
+                        for (SafeInterval edge_interval : safe_intervals_edge[edge_index])
+                        {                            
+                            SafeInterval safe_arrival_interval_edge = intersection(safe_arrival_interval_vertex, edge_interval);
+                            SafeInterval safe_departure_interval_edge = intersection(safe_departure_interval_vertex, edge_interval);
+
+                            if (!interval_exists(safe_arrival_interval_edge) ||
+                                !interval_exists(safe_departure_interval_edge))
+                            {
+                                continue;
+                            }
+                            else if (in(safe_departure_interval_edge.start + neighbour_cost, safe_arrival_interval_edge))
+                            {
+                                earliest_arrival_time = safe_departure_interval_edge.start + neighbour_cost;
+                            }
+                            else if (in(safe_arrival_interval_edge.start - neighbour_cost, safe_departure_interval_edge))
+                            {
+                                earliest_arrival_time = safe_arrival_interval_edge.start - neighbour_cost;
+                            }
+                            else
+                            {
+                                continue;
+                            }
+
+                            auto el = std::find(visited[neighbour_to].begin(), visited[neighbour_to].end(), earliest_arrival_time);
+                            if (el == visited[neighbour_to].end())
+                            {
+                                successors.push_back(
+                                    create_ds_sipp_node(current_node, neighbour_to,
+                                                        earliest_arrival_time, vertex_interval.end,
+                                                        neighbour_cost, hvalue, neighbour_speed)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return successors;
+}
+
 static std::vector<SIPPNode>
 sipp(Graph* graph,
-     u32 start, u32 goal,
+     u32 start_vertex, f32 start_speed, u32 goal_vertex, f32 goal_speed,
      f32 (*heuristic)(Graph*, u32, u32),
      ComputeSafeIntervalsResult safe_intervals)
 {
-    std::vector<std::vector<SafeInterval>> safe_intervals_vertex = safe_intervals.safe_intervals_vertex;
-    std::vector<std::vector<SafeInterval>> safe_intervals_edge = safe_intervals.safe_intervals_edge;
-    SIPPNode* node_pool = (SIPPNode*)malloc(sizeof(SIPPNode) * MAX_QUEUE_SIZE);
-    u32 nodes_in_use = 0;
+    std::vector<SIPPNode> node_pool;
+    node_pool.resize(MAX_QUEUE_SIZE);
+    u32 node_count = 0;
     
     std::vector<SIPPNode> result;
 
     std::list<SIPPNode*> queue;
-    SIPPNode* root = GetNode(node_pool, nodes_in_use);
-    f32 root_safe_interval_end = safe_intervals_vertex[start][0].end;
-    if (safe_intervals_vertex[start][0].start > 0)
+    
+    f32 root_safe_interval_end = safe_intervals.safe_intervals_vertex[start_vertex][0].end;
+    if (safe_intervals.safe_intervals_vertex[start_vertex][0].start > 0)
     {
         root_safe_interval_end = 0;
     }
-    create_sipp_node(root,
-                     0, start,
-                     0, root_safe_interval_end,
-                     0, heuristic(graph, start, goal));
-    add_astar_node(queue, root);
+    SIPPNode root = create_ds_sipp_node(0, start_vertex,
+                                        0, root_safe_interval_end,
+                                        0, heuristic(graph, start_vertex, goal_vertex), start_speed);
+    SIPPNode* root_node = &node_pool[node_count++];
+    *root_node = root;
+    add_astar_node(queue, root_node);
     
 
     std::vector<std::vector<f32>> visited;
@@ -512,11 +613,10 @@ sipp(Graph* graph,
         
         u32 current_vertex = current_node->vertex;
         f32 arrival_time = current_node->arrival_time;
-        f32 safe_interval_end = current_node->safe_interval_end;
         
         Assert(current_vertex < graph->vertices.size());
         
-        if (current_vertex == goal && can_wait_forever(safe_intervals_vertex[current_vertex], arrival_time))
+        if (current_vertex == goal_vertex && FloatEq(current_node->speed, goal_speed) && can_wait_forever(safe_intervals.safe_intervals_vertex[current_vertex], arrival_time))
         {
             // NOTE: Reconstruct path from best_path_vertex
             u32 path_length = 0;
@@ -544,69 +644,18 @@ sipp(Graph* graph,
             break;
         }
 
-        std::vector<Edge> neighbours = graph->vertices[current_vertex].edges;
-        for (Edge edge : neighbours)
+        std::vector<SIPPNode> successors = get_successors_ds_sipp(graph, current_node, goal_vertex,
+                                                                   heuristic, safe_intervals,
+                                                                   visited);
+        for (SIPPNode successor : successors)
         {
-            f32 neighbour_cost = edge.cost;
-            u32 neighbour_to = edge.to;
-            f32 hvalue = heuristic(graph, neighbour_to, goal);
-
-            f32 earliest_departure_time = arrival_time;
-            f32 earliest_arrival_time = earliest_departure_time + neighbour_cost;
-            f32 latest_departure_time = safe_interval_end;
-            f32 latest_arrival_time = latest_departure_time + neighbour_cost;
-            SafeInterval arrival_interval = {earliest_arrival_time, latest_arrival_time};
-
-            for (SafeInterval vertex_interval : safe_intervals_vertex[neighbour_to])
-            {
-                SafeInterval safe_arrival_interval_vertex = intersection(arrival_interval, vertex_interval);
-                if (interval_exists(safe_arrival_interval_vertex))
-                {
-                    SafeInterval safe_departure_interval_vertex = {safe_arrival_interval_vertex.start - neighbour_cost,
-                                                                   safe_arrival_interval_vertex.end - neighbour_cost};
-                    u32 edge_index = get_edge_index(graph->vertices.size(), current_vertex,  neighbour_to);
-                    for (SafeInterval edge_interval : safe_intervals_edge[edge_index])
-                    {                            
-                        SafeInterval safe_arrival_interval_edge = intersection(safe_arrival_interval_vertex, edge_interval);
-                        SafeInterval safe_departure_interval_edge = intersection(safe_departure_interval_vertex, edge_interval);
-
-                        if (!interval_exists(safe_arrival_interval_edge) ||
-                            !interval_exists(safe_departure_interval_edge))
-                        {
-                            continue;
-                        }
-                        else if (in(safe_departure_interval_edge.start + neighbour_cost, safe_arrival_interval_edge))
-                        {
-                            earliest_arrival_time = safe_departure_interval_edge.start + neighbour_cost;
-                        }
-                        else if (in(safe_arrival_interval_edge.start - neighbour_cost, safe_departure_interval_edge))
-                        {
-                            earliest_arrival_time = safe_arrival_interval_edge.start - neighbour_cost;
-                        }
-                        else
-                        {
-                            continue;
-                        }
-
-                        auto el = std::find(visited[neighbour_to].begin(), visited[neighbour_to].end(), earliest_arrival_time);
-                        if (el == visited[neighbour_to].end())
-                        {
-                            SIPPNode* new_node = GetNode(node_pool, nodes_in_use);
-                            create_sipp_node(new_node,
-                                             current_node, neighbour_to,
-                                             earliest_arrival_time, vertex_interval.end,
-                                             neighbour_cost, hvalue);
-                            add_astar_node(queue, new_node);
-
-                            visited[neighbour_to].push_back(earliest_arrival_time);
-                        }
-                    }
-                }
-            }
+            SIPPNode* new_node = &node_pool[node_count++];
+            *new_node = successor;
+            add_astar_node(queue, new_node);
+            visited[successor.vertex].push_back(successor.arrival_time);
+            node_count++;
         }
     }
-
-    free(node_pool);
     
     return result;
 }
@@ -614,14 +663,18 @@ sipp(Graph* graph,
 struct AgentInfo
 {
     u32 id;
-    u32 start;
-    u32 goal;
+
+    u32 start_vertex;
+    f32 start_speed;
+    u32 goal_vertex;
+    f32 goal_speed;
+    
+    f32 radius;
 };
 
 struct Solution
 {
     std::vector<std::vector<SIPPNode>> paths;
-    u32 path_count;
 };
 
 static ComputeSafeIntervalsResult
@@ -673,10 +726,7 @@ compute_safe_intervals(Graph* graph, std::vector<Constraint> constraints)
 
 f32 h(Graph* g, u32 vertex, u32 goal)
 {
-    f32 x = g->vertices[vertex].x - g->vertices[goal].x;
-    f32 y = g->vertices[vertex].y - g->vertices[goal].y;
-    
-    return sqrtf(x * x + y * y);
+    return distance(g->vertices[vertex].position, g->vertices[goal].position);
 }        
 
 static f32
@@ -726,8 +776,6 @@ create_action_intervals(SIPPNode vertex, b32 last_vertex,
     ActionIntervals result;
     
     f32 arrival_time_vertex = vertex.arrival_time;
-/* TODO: hämta cost ifrån grafen och använd istället för -1 */
-/* graph->vertices[vertex.vertex]; */
     f32 departure_time_vertex;
     f32 leave_time_vertex;
     if (last_vertex)
@@ -757,6 +805,87 @@ create_action_intervals(SIPPNode vertex, b32 last_vertex,
     return result;
 }
 
+// Source: Guide to anticipatory collision avoidance Chapter 19
+struct Collision
+{
+    f32 t;
+    b32 ok;
+};
+
+static Collision
+get_collision_time(Vec2 pos_1, f32 radius_1, Vec2 velocity_1,
+                   Vec2 pos_2, f32 radius_2, Vec2 velocity_2)
+{
+    Collision result = {};
+    
+    f32 t_pos = 0;
+    f32 t_neg = 0;
+    
+    Vec2 w = pos_2 - pos_1;
+    Vec2 v = velocity_2 - velocity_1;
+    f32 a = dot(v, v);
+    f32 b = dot(w, velocity_1 - velocity_2);
+    f32 radius_sum = radius_1 + radius_2;
+    f32 c = dot(w, w) - radius_sum * radius_sum;
+    
+    f32 term_1 = b * b;
+    f32 term_2 = a * c;
+    if (a > 0 && term_1 >= term_2)
+    {
+        t_pos = (b + sqrtf(term_1 - term_2)) / a;
+        t_neg = (b - sqrtf(term_1 - term_2)) / a;
+
+        result.ok = true;
+    }
+    else
+    {
+        result.ok = false;
+    }
+
+    result.t = fmin(t_pos, t_neg);
+    
+    return result;
+}
+
+static Interval
+get_collision_interval(Vec2 pos_1, f32 radius_1, Vec2 velocity_1,
+                       Vec2 pos_2, f32 radius_2, Vec2 velocity_2,
+                       Interval action_interval)
+{
+    Interval result = UNDEFINED_INTERVAL;
+    
+    Collision c = get_collision_time(pos_1, radius_1, velocity_1,
+                               pos_2, radius_2, velocity_2);
+    f32 t = c.t;
+    
+    if (c.ok && (t > 0 || FloatEq(t, 0)) && action_interval.start + t < action_interval.end)
+    {
+        Vec2 search_pos_1 = pos_1 + velocity_1 * t;
+        Vec2 search_pos_2 = pos_2 + velocity_2 * t;
+            
+        result.start = action_interval.start + t;
+
+        // NOTE: Collision detect until no collision = result.end
+        f32 delta = 0.01f;
+        while (action_interval.start + t < action_interval.end)
+        {
+            t += delta;
+            search_pos_1 += velocity_1 * delta;
+            search_pos_2 += velocity_2 * delta;
+
+            f32 dist = distance(search_pos_1, search_pos_2);
+            if (dist > radius_1 + radius_2)
+            {
+                break;
+            }
+        }
+
+        result.end = result.start + t;
+    }
+
+    return result;
+}
+
 struct FindConflictResult
 {
     b32 no_conflict_found;
@@ -764,7 +893,7 @@ struct FindConflictResult
 };
 
 static FindConflictResult
-find_conflict(std::vector<std::vector<SIPPNode>> path_buffer, Graph* graph)
+find_conflict(std::vector<std::vector<SIPPNode>> path_buffer, Graph* graph, std::vector<AgentInfo> agents)
 {
     FindConflictResult result = {};
     result.no_conflict_found = true;
@@ -775,119 +904,124 @@ find_conflict(std::vector<std::vector<SIPPNode>> path_buffer, Graph* graph)
          agent_index++)
     {
         std::vector<SIPPNode> path = path_buffer[agent_index];
-        for (u32 vertex_index = 0;
-             vertex_index < path.size() && result.no_conflict_found;
-             vertex_index++)
+        for (u32 node_index = 0;
+             node_index < path.size() - 1 && result.no_conflict_found;
+             node_index++)
         {
-            SIPPNode vertex = path[vertex_index];
-            SIPPNode next_vertex = path[(vertex_index + 1) % path.size()];
-            b32 last_vertex = vertex_index == path.size() - 1;
-            ActionIntervals action_intervals_vertex = create_action_intervals(vertex, last_vertex, next_vertex, graph);
+            SIPPNode node = path[node_index];
+            Vertex vertex = graph->vertices[node.vertex];
+            SIPPNode next_node = path[(node_index + 1) % path.size()];
+            Vertex next_vertex = graph->vertices[next_node.vertex];
+            b32 last_node = false;//node_index == path.size() - 1;
+            ActionIntervals action_intervals_node = create_action_intervals(node, last_node, next_node, graph);
+            AgentInfo agent_1 = agents[agent_index];
             
             for (u32 other_agent_index = agent_index + 1;
                  other_agent_index < agent_count && result.no_conflict_found;
                  other_agent_index++)
             {
                 std::vector<SIPPNode> other_path = path_buffer[other_agent_index];
-                for (u32 other_vertex_index = 0;
-                     other_vertex_index < other_path.size() && result.no_conflict_found;
-                     other_vertex_index++)
+                for (u32 other_node_index = 0;
+                     other_node_index < other_path.size() - 1 && result.no_conflict_found;
+                     other_node_index++)
                 {
-                    SIPPNode other_vertex = other_path[other_vertex_index];
-                    SIPPNode next_other_vertex = other_path[(other_vertex_index + 1) % other_path.size()];
-                    b32 last_other_vertex = other_vertex_index == other_path.size() - 1;
-                    ActionIntervals action_intervals_other_vertex = create_action_intervals(other_vertex, last_other_vertex, next_other_vertex, graph);
+                    SIPPNode other_node = other_path[other_node_index];
+                    Vertex other_vertex = graph->vertices[other_node.vertex];
+                    SIPPNode next_other_node = other_path[(other_node_index + 1) % other_path.size()];
+                    Vertex next_other_vertex = graph->vertices[next_other_node.vertex];
+                    b32 last_other_node = false; //other_node_index == other_path.size() - 1;
+                    ActionIntervals action_intervals_other_node = create_action_intervals(other_node, last_other_node, next_other_node, graph);
+                    AgentInfo agent_2 = agents[other_agent_index];
 
-                    Interval move_move_interval = intersection(action_intervals_vertex.move, action_intervals_other_vertex.move);
-                    b32 move_move_interval_ok = move_move_interval.start != move_move_interval.end && interval_exists(move_move_interval);
+                    Interval move_move_interval = intersection(action_intervals_node.move, action_intervals_other_node.move);                    
+                    b32 move_move_interval_ok =
+                        move_move_interval.start != move_move_interval.end &&
+                        interval_exists(move_move_interval);
 
-                    Interval move_wait_interval = intersection(action_intervals_vertex.move, action_intervals_other_vertex.wait);
-                    b32 move_wait_interval_ok = move_wait_interval.start != move_wait_interval.end && interval_exists(move_wait_interval);
+                    Interval move_wait_interval = intersection(action_intervals_node.move, action_intervals_other_node.wait);
+                    b32 move_wait_interval_ok =
+                        move_wait_interval.start != move_wait_interval.end &&
+                        interval_exists(move_wait_interval);
 
-                    Interval wait_move_interval = intersection(action_intervals_vertex.wait, action_intervals_other_vertex.move);
-                    b32 wait_move_interval_ok = wait_move_interval.start != wait_move_interval.end && interval_exists(wait_move_interval);
+                    Interval wait_move_interval = intersection(action_intervals_node.wait, action_intervals_other_node.move);
+                    b32 wait_move_interval_ok =
+                        wait_move_interval.start != wait_move_interval.end &&
+                        interval_exists(wait_move_interval);
                     
-                    Interval wait_wait_interval = intersection(action_intervals_vertex.wait, action_intervals_other_vertex.wait);
-                    b32 wait_wait_interval_ok = wait_wait_interval.start != wait_wait_interval.end && interval_exists(wait_wait_interval);
-                                        
-                    // NOTE: Conflict where both move into same vertex
-                    if (!last_vertex && !last_other_vertex &&
-                        next_vertex.vertex == next_other_vertex.vertex &&
-                        move_move_interval_ok)
-                    {
-                        result.no_conflict_found = false;
-                        result.conflict.interval = move_move_interval;
+                    Vec2 agent_1_pos = vertex.position;
+                    Vec2 agent_2_pos = other_vertex.position;
+                        
+                    Vec2 velocity_1 = next_vertex.position - vertex.position;
+                    Vec2 velocity_2 = next_other_vertex.position - other_vertex.position;
+                    Vec2 zero_velocity = {};
+                    
+                    if (move_move_interval_ok)
+                    {    
+                        Interval collision_interval = get_collision_interval(
+                            agent_1_pos, agent_1.radius, velocity_1,
+                            agent_2_pos, agent_2.radius, velocity_2,
+                            move_move_interval
+                        );
 
-                        result.conflict.agent_1_id = agent_index;
-                        result.conflict.action_1 = {action_intervals_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_1.move.from = vertex.vertex;
-                        result.conflict.action_1.move.to = next_vertex.vertex;
+                        if (interval_exists(collision_interval))
+                        {    
+                            result.no_conflict_found = false;
+                            result.conflict.interval = collision_interval;
 
-                        result.conflict.agent_2_id = other_agent_index;
-                        result.conflict.action_2 = {action_intervals_other_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_2.move.from = other_vertex.vertex;
-                        result.conflict.action_2.move.to = next_other_vertex.vertex;
+                            result.conflict.agent_1_id = agent_index;
+                            result.conflict.action_1 = {action_intervals_node.move, ACTION_TYPE_MOVE};
+                            result.conflict.action_1.move.from = node.vertex;
+                            result.conflict.action_1.move.to = next_node.vertex;
+
+                            result.conflict.agent_2_id = other_agent_index;
+                            result.conflict.action_2 = {action_intervals_other_node.move, ACTION_TYPE_MOVE};
+                            result.conflict.action_2.move.from = other_node.vertex;
+                            result.conflict.action_2.move.to = next_other_node.vertex;
+                        }
                     }
-                    // NOTE: Conflict where both collide on edge
-                    else if (!last_vertex && !last_other_vertex &&
-                             next_vertex.vertex == other_vertex.vertex &&
-                             vertex.vertex == next_other_vertex.vertex &&
-                             move_move_interval_ok)
+                    else if (move_wait_interval_ok)
                     {
-                        result.no_conflict_found = false;
-                        result.conflict.interval = move_move_interval;
+                        Interval collision_interval = get_collision_interval(
+                            agent_1_pos, agent_1.radius, velocity_1,
+                            agent_2_pos, agent_2.radius, zero_velocity,
+                            move_wait_interval
+                        );
 
-                        result.conflict.agent_1_id = agent_index;
-                        result.conflict.action_1 = {action_intervals_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_1.move.from = vertex.vertex;
-                        result.conflict.action_1.move.to = next_vertex.vertex;
+                        if (interval_exists(collision_interval))
+                        {
+                            result.no_conflict_found = false;
+                            result.conflict.interval = collision_interval;
 
-                        result.conflict.agent_2_id = other_agent_index;
-                        result.conflict.action_2 = {action_intervals_other_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_2.move.from = other_vertex.vertex;
-                        result.conflict.action_2.move.to = next_other_vertex.vertex;
+                            result.conflict.agent_1_id = agent_index;
+                            result.conflict.action_1 = {action_intervals_node.move, ACTION_TYPE_MOVE};
+                            result.conflict.action_1.move.from = node.vertex;
+                            result.conflict.action_1.move.to = next_node.vertex;
+
+                            result.conflict.agent_2_id = other_agent_index;
+                            result.conflict.action_2 = {action_intervals_other_node.wait, ACTION_TYPE_WAIT, other_node.vertex};
+                        }
                     }
-                    // NOTE: Conflict where prime agent move into waiting agent
-                    else if (!last_vertex &&
-                             next_vertex.vertex == other_vertex.vertex &&
-                             move_wait_interval_ok)
+                    else if (wait_move_interval_ok)
                     {
-                        result.no_conflict_found = false;
-                        result.conflict.interval = move_wait_interval;
+                        Interval collision_interval = get_collision_interval(
+                            agent_1_pos, agent_1.radius, zero_velocity,
+                            agent_2_pos, agent_2.radius, velocity_2,
+                            wait_move_interval
+                        );
 
-                        result.conflict.agent_1_id = agent_index;
-                        result.conflict.action_1 = {action_intervals_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_1.move.from = vertex.vertex;
-                        result.conflict.action_1.move.to = next_vertex.vertex;
+                        if (interval_exists(collision_interval))
+                        {
+                            result.no_conflict_found = false;
+                            result.conflict.interval = collision_interval;
 
-                        result.conflict.agent_2_id = other_agent_index;
-                        result.conflict.action_2 = {action_intervals_other_vertex.wait, ACTION_TYPE_WAIT, other_vertex.vertex};
-                    }
-                    else if (!last_other_vertex &&
-                             vertex.vertex == next_other_vertex.vertex &&
-                             wait_move_interval_ok)
-                    {
-                        result.no_conflict_found = false;
-                        result.conflict.interval = wait_move_interval;
+                            result.conflict.agent_1_id = agent_index;
+                            result.conflict.action_1 = {action_intervals_node.wait, ACTION_TYPE_WAIT, node.vertex};
 
-                        result.conflict.agent_1_id = agent_index;
-                        result.conflict.action_1 = {action_intervals_vertex.wait, ACTION_TYPE_WAIT, vertex.vertex};
-
-                        result.conflict.agent_2_id = other_agent_index;
-                        result.conflict.action_2 = {action_intervals_other_vertex.move, ACTION_TYPE_MOVE};
-                        result.conflict.action_2.move.from = other_vertex.vertex;
-                        result.conflict.action_2.move.to = next_other_vertex.vertex;
-                    }
-                    else if (vertex.vertex == other_vertex.vertex && wait_wait_interval_ok)
-                    {
-                        result.no_conflict_found = false;
-                        result.conflict.interval = wait_wait_interval;;
-
-                        result.conflict.agent_1_id = agent_index;
-                        result.conflict.action_1 = {action_intervals_vertex.wait, ACTION_TYPE_WAIT, vertex.vertex};
-
-                        result.conflict.agent_2_id = other_agent_index;
-                        result.conflict.action_2 = {action_intervals_other_vertex.wait, ACTION_TYPE_WAIT, other_vertex.vertex};
+                            result.conflict.agent_2_id = other_agent_index;
+                            result.conflict.action_2 = {action_intervals_other_node.move, ACTION_TYPE_MOVE};
+                            result.conflict.action_2.move.from = other_node.vertex;
+                            result.conflict.action_2.move.to = next_other_node.vertex;
+                        }
                     }
                 }
             }
@@ -989,9 +1123,9 @@ create_cbs_node(CBSNode* new_node,
     ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
     std::vector<SIPPNode> new_path = sipp(graph,
-                                        agents[agent_id].start,
-                                        agents[agent_id].goal,
-                                        h, safe_intervals);
+                                          agents[agent_id].start_vertex, agents[agent_id].start_speed,
+                                          agents[agent_id].goal_vertex, agents[agent_id].goal_speed,
+                                          h, safe_intervals);
     if (new_path.size() == 0)
     {
         new_node->valid = false;
@@ -1038,8 +1172,8 @@ cbs(Graph* graph, std::vector<AgentInfo> agents)
             ComputeSafeIntervalsResult safe_intervals = compute_safe_intervals(graph, constraints);
 
             path_buffer[agent.id] = sipp(graph,
-                                         agent.start,
-                                         agent.goal,
+                                         agent.start_vertex, agent.start_speed,
+                                         agent.goal_vertex, agent.goal_speed,
                                          h, safe_intervals);
             if (path_buffer[agent.id].size() == 0)
             {
@@ -1050,10 +1184,11 @@ cbs(Graph* graph, std::vector<AgentInfo> agents)
 
         if (all_paths_valid)
         {
-            FindConflictResult find_conflict_result = find_conflict(path_buffer, graph);
+            FindConflictResult find_conflict_result = find_conflict(path_buffer, graph, agents);
             if (find_conflict_result.no_conflict_found)
             {
-                Assert(!"done");
+                result.paths = path_buffer;
+                break;
             }
             Conflict new_conflict = find_conflict_result.conflict;
 
@@ -1097,192 +1232,10 @@ cbs(Graph* graph, std::vector<AgentInfo> agents)
     
     return result;
 }
-    
-struct GraphData
-{
-    Graph graph;
-    std::vector<AgentInfo> agents;
-};
-
-static GraphData
-load_graph(const char* filename)
-{
-    GraphData graph_result;
-
-    DebugReadFileResult graph_file = DEBUG_platform_read_entire_file(filename);
-    
-    char* graph_raw = (char*)graph_file.contents;
-
-    u32 graph_raw_index = 0;
-
-    u32 agent_count = 0;
-    u32 vertex_count = 0;
-    skip_whitespace(&graph_raw_index, graph_raw);
-    StringToU32Result agent_count_parse = string_to_u32(graph_raw, graph_raw_index);
-    agent_count = agent_count_parse.number;
-    graph_raw_index += agent_count_parse.length;
-    while(graph_raw[graph_raw_index++] != ',');
-    StringToU32Result vertex_count_parse = string_to_u32(graph_raw, graph_raw_index);
-    vertex_count = vertex_count_parse.number;
-    graph_raw_index += vertex_count_parse.length;
-    graph_result.agents.resize(agent_count);
-    
-    u32 current_vertex = 0;
-    u32 parsed_agents = 0;
-
-    graph_result.graph.vertices.resize(vertex_count);
-        
-    for (; graph_raw_index < graph_file.contents_size;
-         graph_raw_index++)
-    {
-        if (IsCharacter(graph_raw[graph_raw_index]))
-        {
-            Assert(current_vertex < vertex_count);
-            if (graph_raw[graph_raw_index] == 'a')
-            {
-                while(graph_raw[graph_raw_index++] != ',');
-                skip_whitespace(&graph_raw_index, graph_raw);
-                Assert(graph_raw[graph_raw_index] == 'n');
-                graph_raw_index++;
-                StringToU32Result vertex_parse = string_to_u32(graph_raw, graph_raw_index);
-                graph_result.agents[parsed_agents].start = vertex_parse.number;
-                graph_raw_index += vertex_parse.length;
-
-                while(graph_raw[graph_raw_index++] != ',');
-                skip_whitespace(&graph_raw_index, graph_raw);
-                Assert(graph_raw[graph_raw_index] == 'n');
-                graph_raw_index++;
-                vertex_parse = string_to_u32(graph_raw, graph_raw_index);
-                graph_result.agents[parsed_agents].goal = vertex_parse.number;
-                graph_raw_index += vertex_parse.length;
-                
-                graph_result.agents[parsed_agents].id = parsed_agents;
-                parsed_agents++;
-            }
-            else if (graph_raw[graph_raw_index] == 'n')
-            {
-                Vertex* vertex = &graph_result.graph.vertices[current_vertex];
-                
-                while(graph_raw[graph_raw_index++] != ':');
-                while(graph_raw[graph_raw_index++] != '(');
-                skip_whitespace(&graph_raw_index, graph_raw);
-                StringToU32Result x_parse = string_to_u32(graph_raw, graph_raw_index);
-                vertex->x = (f32)x_parse.number;
-                while(graph_raw[graph_raw_index++] != ',');
-                skip_whitespace(&graph_raw_index, graph_raw);
-                StringToU32Result y_parse = string_to_u32(graph_raw, graph_raw_index);
-                vertex->y = (f32)y_parse.number;
-                while(graph_raw[graph_raw_index++] != ')');
-                skip_whitespace(&graph_raw_index, graph_raw);
-
-                /* vertex->edges ; */
-                while(graph_raw[graph_raw_index] != ';')
-                {
-                    while(graph_raw[graph_raw_index++] != ',');
-                    skip_whitespace(&graph_raw_index, graph_raw);
-                    Assert(graph_raw[graph_raw_index] == 'n');
-                    graph_raw_index++;
-                    Edge edge;
-                    StringToU32Result edge_parse = string_to_u32(graph_raw, graph_raw_index);
-                    edge.to = edge_parse.number;
-                    graph_raw_index += edge_parse.length;
-
-                    while(graph_raw[graph_raw_index++] != ':');
-                    StringToU32Result cost_parse = string_to_u32(graph_raw, graph_raw_index);
-                    edge.cost = (f32)cost_parse.number;
-                    graph_raw_index += cost_parse.length;
-                    
-                    vertex->edges.push_back(edge);
-                    skip_whitespace(&graph_raw_index, graph_raw);
-                }
-                
-                current_vertex++;
-            }
-        }
-        else if (graph_raw[graph_raw_index] == ',' ||
-                 IsWhitespace(graph_raw[graph_raw_index])){}
-        else InvalidCodePath;
-    }
-
-    DEBUG_platform_free_file_memory(graph_file.contents);
-    
-    return graph_result;
-}
-
-struct SimulatorState
-{
-    b32 is_initialized;
-    Graph* graph;
-};
 
 static void
-simulate(SimulatorState* simulator_state)
-{
-    if (!simulator_state->is_initialized)
-    {
-        GraphData graph_data = load_graph("graphs/grid3x3.grid");
-            
-        simulator_state->is_initialized = true;
-
-#if 0
-        Conflicts* c1 = push_struct(memory_arena, Conflicts);
-        c1->interval = {0, 1};
-        c1->agent_1_id = 0;
-        c1->action_1 = {{0, 1}, ACTION_TYPE_WAIT};
-        c1->action_1.move = {1, 0};
-        Conflicts* c2 = push_struct(memory_arena, Conflicts);
-        c2->interval = {1, 2};
-        c2->agent_1_id = 0;
-        c2->action_1 = {{1, 2}, ACTION_TYPE_WAIT};
-        c2->action_1.move = {1, 0};
-        c1->next = c2;
-        Conflicts* c3 = push_struct(memory_arena, Conflicts);
-        c3->interval = {2, 3};
-        c3->agent_1_id = 0;
-        c3->action_1 = {{2, 3}, ACTION_TYPE_MOVE};
-        c3->action_1.move = {1, 0};
-        /* c2->next = c3; */
-        Conflicts* c4 = push_struct(memory_arena, Conflicts);
-        c4->interval = {3, 4};
-        c4->agent_1_id = 0;
-        c4->action_1 = {{3, 4}, ACTION_TYPE_MOVE};
-        c4->action_1.move = {1, 0};
-        c3->next = c4;
-        Conflicts* c5 = push_struct(memory_arena, Conflicts);
-        c5->interval = {4, 5};
-        c5->agent_1_id = 0;
-        c5->action_1 = {{4, 5}, ACTION_TYPE_MOVE};
-        c5->action_1.move = {1, 0};
-        c4->next = c5;
-        Conflicts* c6 = push_struct(memory_arena, Conflicts);
-        c6->interval = {5, 6};
-        c6->agent_1_id = 0;
-        c6->action_1 = {{5, 6}, ACTION_TYPE_MOVE};
-        c6->action_1.move = {1, 0};
-        c5->next = c6;
-        Conflicts* c7 = push_struct(memory_arena, Conflicts);
-        c7->interval = {6, 7};
-        c7->agent_1_id = 0;
-        c7->action_1 = {{6, 7}, ACTION_TYPE_MOVE};
-        c7->action_1.move = {1, 0};
-        c6->next = c7;
-        
-        sipp(memory_arena,
-             graph_data.graph,
-             1, 0,
-             h,
-             c1, 0);
-        int x = 0;
-#endif
-        Solution solution = cbs(&graph_data.graph, graph_data.agents);
-        /* Constraint* c2 = push_struct(memory_arena, Constraint); */
-        /* c2->time = 2; */
-        /* c2->vertex = 4; */
-        /* constraints->add(memory_arena, (u8*)c2, sizeof(Constraint)); */
-
-        /* Constraint* c4 = push_struct(memory_arena, Constraint); */
-        /* c4->time = 3; */
-        /* c4->vertex = 4; */
-        /* constraints->add(memory_arena, (u8*)c4, sizeof(Constraint)); */
-    }
+simulate(Graph graph, std::vector<AgentInfo> agents)
+{    
+    Solution solution = cbs(&graph, agents);
+    int x = 0;
 }
